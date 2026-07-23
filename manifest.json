@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "OpenKey 配置搬运助手",
+  "version": "0.1.0",
+  "description": "在 NewAPI、Sub2API 和 Linux.do 之间搬运 AI 配置。",
+  "permissions": [
+    "clipboardRead",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "action": {
+    "default_title": "OpenKey",
+    "default_popup": "src/popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "css": ["src/content.css"],
+      "js": ["src/core.js", "src/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
