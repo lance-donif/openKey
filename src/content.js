@@ -199,51 +199,178 @@
     }
   }
 
+  async function waitForClipboardChange(before, timeout = 2000) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      const current = await readClipboardText();
+      if (current && current !== before) return current;
+      await sleep(80);
+    }
+    return "";
+  }
+
+  function nodeLabel(node) {
+    return normalizeText([
+      node?.getAttribute?.("aria-label"),
+      node?.getAttribute?.("title"),
+      node?.getAttribute?.("data-testid"),
+      node?.getAttribute?.("class"),
+      node?.innerText,
+      node?.textContent
+    ].filter(Boolean).join(" "));
+  }
+
+  function isDestructiveControl(node) {
+    return /删除|delete|移除|remove|禁用|disable|编辑|edit|聊天|chat/i.test(nodeLabel(node));
+  }
+
+  function findOpenMenuItems() {
+    const roots = [
+      ...document.querySelectorAll('[role="menu"], [role="listbox"], .semi-dropdown, .ant-dropdown, [class*="dropdown-menu"], [class*="Dropdown"]')
+    ].filter(visible);
+    const scopes = roots.length ? roots : [document];
+    const selectors = [
+      '[role="menuitem"]',
+      '[role="option"]',
+      '.semi-dropdown-item',
+      '.ant-dropdown-menu-item',
+      'li'
+    ];
+    const items = [];
+    const seen = new Set();
+    for (const root of scopes) {
+      for (const selector of selectors) {
+        for (const node of root.querySelectorAll(selector)) {
+          if (seen.has(node) || !visible(node) || isDestructiveControl(node)) continue;
+          seen.add(node);
+          items.push(node);
+        }
+      }
+    }
+    return items;
+  }
+
   function findMenuItem(labels) {
-    const expected = Array.isArray(labels) ? labels : [labels];
-    return [...document.querySelectorAll('[role="menuitem"]')]
-      .find(item => visible(item) && expected.includes(normalizeText(item.innerText || item.textContent))) || null;
+    const expected = (Array.isArray(labels) ? labels : [labels]).map(normalizeText).filter(Boolean);
+    if (!expected.length) return null;
+    // Prefer exact/full-phrase matches only; never partial-match short labels like "复制".
+    return findOpenMenuItems().find(item => {
+      const text = nodeLabel(item);
+      if (!text || isDestructiveControl(item)) return false;
+      return expected.some(label => text === label || (label.length >= 4 && text.includes(label)));
+    }) || null;
+  }
+
+  function findKeyCopyTrigger(row) {
+    const root = row?.keyCell;
+    if (!root) return null;
+    let best = null;
+    let bestScore = 0;
+    for (const node of root.querySelectorAll("button, [role='button'], a, span, div, i, svg")) {
+      if (!visible(node) || getComputedStyle(node).pointerEvents === "none") continue;
+      const candidate = node.closest("button, [role='button'], a, [class*='semi-button'], [class*='dropdown']") || node;
+      if (isDestructiveControl(candidate)) continue;
+      const label = nodeLabel(candidate).toLowerCase();
+      let score = 0;
+      if (/复制连接信息|复制链接信息|copy connection|copy link/.test(label)) score += 100;
+      if (/复制密钥|copy api key|copy key|copy token/.test(label)) score += 80;
+      if (/复制|copy|clipboard|icon-copy|semi-icons-copy|lucide-copy/.test(label)) score += 60;
+      if (candidate.getAttribute?.("aria-haspopup")) score += 20;
+      if (/eye|visible|查看|显示/.test(label)) score -= 50;
+      const rect = candidate.getBoundingClientRect?.();
+      if (rect && rect.width > 0 && rect.width <= 36 && rect.height <= 36) score += 15;
+      // Key-cell icon buttons without text still count if they look like copy triggers.
+      if (!label && rect && rect.width <= 36 && rect.height <= 36) score += 25;
+      if (score > bestScore) {
+        best = candidate;
+        bestScore = score;
+      }
+    }
+    return bestScore >= 25 ? best : null;
+  }
+
+  async function dismissOpenMenus() {
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await sleep(60);
   }
 
   async function copyNewApiMenuText(row, labels) {
-    const tableRow = row.keyCell?.closest("tr");
-    const menuButton = tableRow?.querySelector('button[aria-label="打开菜单"], button[aria-label="Open menu"], button[aria-haspopup="menu"]');
+    // ONLY the key-column copy control. Never touch row actions (删除/编辑/禁用).
+    const menuButton = findKeyCopyTrigger(row);
     if (!menuButton) return "";
 
+    const before = await readClipboardText();
+    await dismissOpenMenus();
     menuButton.click();
-    const menuItem = await waitFor(() => findMenuItem(labels));
-    if (!menuItem) return "";
+    const menuItem = await waitFor(() => findMenuItem(labels), 2500);
+    if (!menuItem) {
+      const direct = await waitForClipboardChange(before, 500);
+      await dismissOpenMenus();
+      return direct;
+    }
+    if (isDestructiveControl(menuItem)) {
+      await dismissOpenMenus();
+      return "";
+    }
     menuItem.click();
-    await sleep(120);
-    return readClipboardText();
+    const text = await waitForClipboardChange(before, 2000);
+    await dismissOpenMenus();
+    return text;
   }
 
   async function collectNewApiConfigs() {
     const rows = CORE.extractNewApiRows(document, location.href);
+    const origin = location.origin;
+    // Prefer API unmask first — no risk of clicking 删除.
+    const missingIds = rows.filter(row => !row.apiKey && row.tokenId).map(row => row.tokenId);
+    let keyMap = {};
+    if (missingIds.length) {
+      keyMap = await CORE.fetchNewApiTokenKeysBatch(origin, missingIds);
+    }
     for (const row of rows) {
-      const connectionInfo = await copyNewApiMenuText(row, ["复制连接信息", "Copy Connection Info"]);
-      Object.assign(row, CORE.mergeNewApiCopiedInfo(row, connectionInfo, location.href));
-      if (!row.apiKey) {
-        const copiedKey = await copyNewApiMenuText(row, ["复制密钥", "Copy API Key"]);
-        Object.assign(row, CORE.mergeNewApiCopiedInfo(row, copiedKey, location.href));
+      if (!row.apiKey && row.tokenId && keyMap[row.tokenId]) {
+        row.apiKey = keyMap[row.tokenId];
       }
+      if (!row.apiKey && row.tokenId) {
+        row.apiKey = await CORE.fetchNewApiTokenKey(origin, row.tokenId);
+      }
+      // Clipboard only if API still failed; key-column copy icon only.
+      if (!row.apiKey || !row.endpoint || row.endpoint === origin) {
+        const connectionInfo = await copyNewApiMenuText(row, [
+          "复制连接信息",
+          "复制链接信息",
+          "Copy Connection Info",
+          "Copy Link Info"
+        ]);
+        if (connectionInfo) {
+          Object.assign(row, CORE.mergeNewApiCopiedInfo(row, connectionInfo, location.href));
+        }
+      }
+      if (!row.apiKey) {
+        const copiedKey = await copyNewApiMenuText(row, ["复制密钥", "Copy API Key", "复制令牌", "Copy Token"]);
+        if (copiedKey) Object.assign(row, CORE.mergeNewApiCopiedInfo(row, copiedKey, location.href));
+      }
+      if (!row.endpoint) row.endpoint = origin;
       row.keyCell = undefined;
+      row.rowEl = undefined;
     }
     return rows.map(row => ({
       id: row.id,
       name: row.name,
-      endpoint: row.endpoint,
+      endpoint: row.endpoint || origin,
       apiKey: row.apiKey,
-      model: row.model,
+      model: row.model || "",
       source: location.href,
       needsManualKey: !row.apiKey
     }));
   }
 
   async function initNewApiPage() {
-    const hasApiKeyTable = [...document.querySelectorAll("table")].some(table => /api\s*(?:密钥|key)/i.test(table.querySelector("thead")?.textContent || ""));
-    if (!location.pathname.startsWith("/keys") || !hasApiKeyTable) return;
-    const anchor = findButton(document, text => text === "状态" || text === "Status") || findButton(document, text => /^(?:创建 API 密钥|Create API Key)$/i.test(text));
+    const hasApiKeyTable = [...document.querySelectorAll("table")].some(table => CORE.isNewApiTokenHeaders(CORE.getHeaderTexts(table)));
+    if (!CORE.isNewApiKeysPath(location.pathname) || !hasApiKeyTable) return;
+    const anchor = findButton(document, text => text === "状态" || text === "Status")
+      || findButton(document, text => /^(?:创建 API 密钥|Create API Key|添加令牌|添加密钥|新建令牌|Add Token)$/i.test(text))
+      || findButton(document, text => /创建|添加|新建/.test(text) && /密钥|令牌|key|token/i.test(text));
     const widget = createWidget("openkey-newapi-widget", "导出到 Sub2API", anchor);
     widget?.mount?.(anchor);
     if (!widget || widget.__initialized) return;
@@ -256,7 +383,7 @@
           widget.open("没有发现 API Key 列表", `<div class="warning">请确认当前页面是 NewAPI 的 API 密钥列表页，并等待列表加载完成。</div>`, [{ label: "关闭", onClick: () => widget.close(), primary: true }]);
           return;
         }
-        widget.open("选择要导入的配置", `<div class="notice">选中后会直接创建 Sub2API 账号、同步上游模型并加入“白嫖”分组，不再要求在账号页确认。</div>${configs.map((config, index) => configItemHtml(config, index)).join("")}`, [
+        widget.open("选择要导入的配置", `<div class="notice">选中后会直接创建 Sub2API 账号，再清除所有模型、同步上游全量模型，最后加入“白嫖”分组。</div>${configs.map((config, index) => configItemHtml(config, index)).join("")}`, [
           { label: "取消", onClick: () => widget.close() },
           { label: "直接导入 Sub2API", primary: true, onClick: async button => {
             const selected = getSelectedConfigs(widget.shadow, configs);
@@ -288,9 +415,9 @@
     if (!result?.ok) throw new Error(result?.error || "更新待导入配置失败");
   }
 
-  function getNativeSub2ApiDialog() {
+  function getNativeSub2ApiDialog(titlePattern = /^(?:添加账号|Add Account)$/) {
     return [...document.querySelectorAll('[role="dialog"]')]
-      .find(dialog => visible(dialog) && /^(?:添加账号|Add Account)$/.test(normalizeText(dialog.querySelector("h1, h2, h3")?.textContent)));
+      .find(dialog => visible(dialog) && titlePattern.test(normalizeText(dialog.querySelector("h1, h2, h3")?.textContent)));
   }
 
   function findNativeInput(dialog, placeholderPattern) {
@@ -313,6 +440,123 @@
     }) || null;
   }
 
+  function findAccountRowByName(name) {
+    const target = normalizeText(name);
+    if (!target) return null;
+    const rows = [...document.querySelectorAll("tr, [role='row'], li, .divide-y > *")].filter(visible);
+    return rows.find(row => {
+      const text = normalizeText(row.innerText || row.textContent);
+      if (!text.includes(target)) return false;
+      return Boolean(findButton(row, value => value === "编辑" || value === "Edit" || value.startsWith("编辑") || value.startsWith("Edit")));
+    }) || null;
+  }
+
+  async function openAccountEditDialog(name) {
+    const row = await waitFor(() => findAccountRowByName(name), 10000);
+    if (!row) throw new Error(`创建后未在列表中找到账号“${name}”`);
+    const editButton = findButton(row, value => value === "编辑" || value === "Edit" || value.startsWith("编辑") || value.startsWith("Edit"));
+    if (!editButton) throw new Error(`账号“${name}”没有编辑按钮`);
+    editButton.click();
+    const dialog = await waitFor(() => getNativeSub2ApiDialog(/^(?:编辑账号|Edit Account)$/), 10000);
+    if (!dialog) throw new Error("Sub2API 编辑账号表单没有打开");
+    return dialog;
+  }
+
+  async function ensureModelWhitelistMode(dialog) {
+    const whitelistButton = findButton(dialog, text => text === "模型白名单" || text === "Model Whitelist" || /模型白名单|Model Whitelist/i.test(text));
+    whitelistButton?.click();
+  }
+
+  async function clearAllModelsInDialog(dialog) {
+    const clearButton = await waitFor(
+      () => findButton(dialog, text => text === "清除所有模型" || text === "Clear all models"),
+      8000
+    );
+    if (!clearButton) throw new Error("清除所有模型：没有找到按钮");
+    clearButton.click();
+  }
+
+  function countDialogModels(dialog) {
+    if (!dialog) return 0;
+    const checks = [...dialog.querySelectorAll('input[type="checkbox"]')].filter(visible);
+    // Group checkboxes are few; model whitelist rows dominate after sync.
+    const modelish = checks.filter(input => {
+      const text = normalizeText(input.closest("label")?.innerText || input.parentElement?.innerText || "");
+      if (!text) return false;
+      if (/^(?:白嫖|default|分组|Group|模型白名单|Model Whitelist)/i.test(text)) return false;
+      return true;
+    });
+    if (modelish.length) return modelish.length;
+    const chips = [...dialog.querySelectorAll('[class*="model"], [class*="tag"], li, [role="option"], [role="listitem"]')]
+      .filter(visible)
+      .map(node => normalizeText(node.innerText || node.textContent))
+      .filter(text => text && text.length < 80 && !/同步上游|清除所有模型|模型白名单|保存|取消|分组/i.test(text));
+    return chips.length;
+  }
+
+  function isSyncUpstreamBusy(dialog) {
+    const button = findButton(dialog, text => /同步上游|Sync upstream/i.test(text));
+    if (!button) return false;
+    const label = normalizeText(button.innerText || button.textContent);
+    return button.disabled || /同步上游中|Syncing upstream|同步中|Loading|加载中/i.test(label);
+  }
+
+  async function syncUpstreamModelsInDialog(dialog) {
+    const syncButton = await waitFor(
+      () => findButton(dialog, text => text === "同步上游支持的模型" || text === "Sync upstream supported models" || /^同步上游/.test(text) || /^Sync upstream/i.test(text)),
+      8000
+    );
+    if (!syncButton) throw new Error("同步上游：没有找到“同步上游支持的模型”按钮");
+    syncButton.click();
+
+    // Upstream sync is slow: wait until not busy AND the model list actually has entries.
+    let stableHits = 0;
+    const ready = await waitFor(() => {
+      if (isSyncUpstreamBusy(dialog)) {
+        stableHits = 0;
+        return null;
+      }
+      const count = countDialogModels(dialog);
+      if (count <= 0) {
+        stableHits = 0;
+        return null;
+      }
+      stableHits += 1;
+      // Keep the list stable for a couple polls so late-arriving rows are kept.
+      return stableHits >= 3 ? count : null;
+    }, 120000);
+
+    if (!ready) {
+      throw new Error("同步上游：已结束但模型列表仍为空，请检查上游地址/密钥后重试");
+    }
+  }
+
+  async function selectGroupAndSaveDialog(dialog, groupLabel) {
+    const groupCheckbox = await waitFor(() => findNativeGroupCheckbox(dialog, groupLabel), 8000);
+    if (!groupCheckbox) throw new Error(`选择分组：没有找到“${groupLabel}”分组`);
+    if (!groupCheckbox.checked) groupCheckbox.click();
+
+    const saveButton = findButton(dialog, text => text === "保存" || text === "更新" || text === "Save" || text === "Update");
+    if (!saveButton) throw new Error("保存账号：没有找到保存/更新按钮");
+    saveButton.click();
+    const closed = await waitFor(() => !document.contains(dialog) || !visible(dialog), 15000);
+    if (!closed) throw new Error("保存账号：Sub2API 没有确认保存结果");
+  }
+
+  async function finishSub2ApiAccountModelsAndGroup(plan) {
+    const dialog = await openAccountEditDialog(plan.name);
+    try {
+      await ensureModelWhitelistMode(dialog);
+      await clearAllModelsInDialog(dialog);
+      await syncUpstreamModelsInDialog(dialog);
+      await selectGroupAndSaveDialog(dialog, plan.groupLabel);
+    } catch (error) {
+      const closeButton = findButton(dialog, text => text === "取消" || text === "Cancel" || text === "关闭" || text === "Close");
+      closeButton?.click();
+      throw error;
+    }
+  }
+
   async function createSub2ApiAccountWithNativeUi(config) {
     const plan = CORE.buildSub2ApiUiImportPlan(config);
     if (!plan.endpoint || !plan.apiKey) throw new Error("缺少完整地址或 API Key");
@@ -321,7 +565,7 @@
     if (!addButton) throw new Error("没有找到 Sub2API 的添加账号按钮");
     addButton.click();
 
-    const dialog = await waitFor(getNativeSub2ApiDialog);
+    const dialog = await waitFor(() => getNativeSub2ApiDialog(/^(?:添加账号|Add Account)$/));
     if (!dialog) throw new Error("Sub2API 添加账号表单没有打开");
 
     const platformButton = findButton(dialog, text => text === plan.platformLabel);
@@ -338,15 +582,13 @@
     setNativeInputValue(endpointInput, plan.endpoint);
     setNativeInputValue(apiKeyInput, plan.apiKey);
 
-    const groupCheckbox = await waitFor(() => findNativeGroupCheckbox(dialog, plan.groupLabel));
-    if (!groupCheckbox) throw new Error(`没有找到“${plan.groupLabel}”分组`);
-    if (!groupCheckbox.checked) groupCheckbox.click();
-
     const createButton = findButton(dialog, text => text === "创建" || text === "Create");
     if (!createButton) throw new Error("没有找到 Sub2API 创建按钮");
     createButton.click();
     const closed = await waitFor(() => !document.contains(dialog) || !visible(dialog), 10000);
     if (!closed) throw new Error("Sub2API 没有确认账号创建结果");
+
+    await finishSub2ApiAccountModelsAndGroup(plan);
   }
 
   let handledDirectImportAt = 0;
@@ -358,23 +600,32 @@
     widget.close();
 
     const remaining = [];
+    const errors = [];
     let imported = 0;
     for (const config of pending.configs) {
       if (!config.apiKey || !config.endpoint) {
         remaining.push(config);
+        errors.push(`${config.name || "配置"}：缺少完整地址或 API Key`);
         continue;
       }
       try {
         await createSub2ApiAccountWithNativeUi(config);
         imported += 1;
-      } catch (_error) {
+      } catch (error) {
         remaining.push(config);
+        errors.push(`${config.name || "配置"}：${error?.message || "导入失败"}`);
       }
     }
     try {
       await updatePendingConfigs(remaining);
-      const failed = remaining.length ? `<div class="warning">${remaining.length} 条未导入，请回到 Key 页重新尝试。</div>` : "";
-      widget.open("Sub2API 直接导入完成", `<div class="notice">已创建 ${imported} 条账号，并加入“白嫖”分组。</div>${failed}`, [{ label: "关闭", onClick: () => widget.close(), primary: true }]);
+      const failed = remaining.length
+        ? `<div class="warning">${remaining.length} 条未完成（创建/清模型/同步上游/分组任一失败）。${errors.length ? `<br>${errors.map(item => escapeHtml(item)).join("<br>")}` : ""}</div>`
+        : "";
+      widget.open(
+        "Sub2API 直接导入完成",
+        `<div class="notice">已完成 ${imported} 条：创建账号 → 清除所有模型 → 同步上游全量模型 → 加入“白嫖”分组。</div>${failed}`,
+        [{ label: "关闭", onClick: () => widget.close(), primary: true }]
+      );
     } catch (error) {
       widget.open("Sub2API 直接导入失败", `<div class="warning">${escapeHtml(error.message || "无法创建账号")}</div>`, [{ label: "关闭", onClick: () => widget.close(), primary: true }]);
     }

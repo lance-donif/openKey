@@ -136,3 +136,81 @@ test("builds a native Sub2API UI import plan without touching login credentials"
     groupLabel: "白嫖"
   });
 });
+
+test("recognizes NewAPI console token paths and 密钥 headers", () => {
+  assert.equal(core.isNewApiKeysPath("/console/token"), true);
+  assert.equal(core.isNewApiKeysPath("/keys"), true);
+  assert.equal(core.isNewApiKeysPath("/token"), true);
+  assert.equal(core.isNewApiKeysPath("/console/log"), false);
+  assert.equal(core.isNewApiTokenHeaders(["名称", "状态", "密钥", "额度"]), true);
+  assert.equal(core.isNewApiTokenHeaders(["ID", "额度"]), false);
+});
+
+test("normalizes NewAPI raw keys and rejects masked table values", () => {
+  assert.equal(core.normalizeNewApiKey("0L6P**********Syd9"), "");
+  assert.equal(core.normalizeNewApiKey("sk-0L6P**********Syd9"), "");
+  assert.equal(core.normalizeNewApiKey("abcdef0123456789abcd"), "sk-abcdef0123456789abcd");
+  assert.equal(core.normalizeNewApiKey("sk-abcdef0123456789abcd"), "sk-abcdef0123456789abcd");
+});
+
+test("extracts token id from NewAPI token table rows", () => {
+  const { JSDOM } = (() => { try { return require("jsdom"); } catch (_error) { return {}; } })();
+  if (!JSDOM) {
+    // DOM-less fallback: ensure helper export exists
+    assert.equal(typeof core.extractNewApiRows, "function");
+    return;
+  }
+  const dom = new JSDOM(`<!doctype html><table><thead><tr>
+    <th>名称</th><th>状态</th><th>剩余额度/总额度</th><th>分组</th><th>密钥</th><th>可用模型</th>
+  </tr></thead><tbody><tr>
+    <td>23</td><td>启用</td><td>无限</td><td>default</td><td>sk-0L6P**********Syd9</td><td>无限制</td>
+  </tr></tbody></table>`);
+  // Note: first column labeled 名称 but contains id in this UI snapshot
+  const rows = core.extractNewApiRows(dom.window.document, "https://newapi.imagic.eu.org/console/token");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].tokenId, 23);
+  assert.equal(rows[0].apiKey, "");
+});
+
+test("fetchNewApiTokenKey normalizes API response keys", async () => {
+  const fetchImpl = async () => ({
+    ok: true,
+    async json() { return { success: true, data: { key: "rawkey_1234567890abcd" } }; }
+  });
+  const key = await core.fetchNewApiTokenKey("https://newapi.imagic.eu.org", 23, fetchImpl);
+  assert.equal(key, "sk-rawkey_1234567890abcd");
+});
+
+test("parses NewAPI 复制链接信息 clipboard payloads", () => {
+  const next = core.mergeNewApiCopiedInfo(
+    { endpoint: "https://newapi.imagic.eu.org", apiKey: "", model: "" },
+    'https://app.nextchat.dev/#/?settings={"key":"sk-demo_link_1234567890","url":"https://newapi.imagic.eu.org"}',
+    "https://newapi.imagic.eu.org/console/token"
+  );
+  assert.equal(next.apiKey, "sk-demo_link_1234567890");
+  assert.equal(next.endpoint, "https://newapi.imagic.eu.org");
+
+  const labeled = core.mergeNewApiCopiedInfo(
+    { endpoint: "", apiKey: "", model: "" },
+    "地址：https://gateway.example.com/v1\n密钥：sk-label_1234567890abcd\n模型：gpt-4o",
+    "https://newapi.imagic.eu.org/console/token"
+  );
+  assert.equal(labeled.endpoint, "https://gateway.example.com/v1");
+  assert.equal(labeled.apiKey, "sk-label_1234567890abcd");
+  assert.equal(labeled.model, "gpt-4o");
+});
+
+test("does not treat API key bodies as models from connection info", () => {
+  const key = "sk-0L6Po3pNAUzdPGmugh1OQxC60JJwOYuZbt3PFTaYSyd9";
+  const merged = core.mergeNewApiCopiedInfo(
+    { endpoint: "", apiKey: "", model: "" },
+    `地址：https://newapi.imagic.eu.org\n密钥：${key}`,
+    "https://newapi.imagic.eu.org/console/token"
+  );
+  assert.equal(merged.apiKey, key);
+  assert.equal(merged.model, "");
+  assert.deepEqual(core.extractModels(key), []);
+  assert.deepEqual(core.extractModels("o3pNAUzdPGmugh1OQxC60JJwOYuZbt3PFTaYSyd9"), []);
+  assert.deepEqual(core.extractModels("model: gpt-4o"), ["gpt-4o"]);
+  assert.deepEqual(core.extractModels("o3-mini"), ["o3-mini"]);
+});

@@ -41,18 +41,34 @@
     return unique([...String(text || "").matchAll(URL_PATTERN)].map(match => trimPunctuation(match[0])));
   }
 
+  function isLikelyModelName(value) {
+    const model = trimPunctuation(value);
+    if (!model || model.length > 64 || /\s/.test(model)) return false;
+    if (isMasked(model) || isLikelyApiKey(model)) return false;
+    // Connection-info keys without sk- can still look like random base62 blobs.
+    if (/^[A-Za-z0-9_-]{24,}$/.test(model) && !/^(?:gpt|o[1-4]|claude|gemini|deepseek|qwen|kimi|moonshot|glm|grok|mistral|llama)/i.test(model)) {
+      return false;
+    }
+    // "o3pNAUzd..." is a key body that starts like model family o3.
+    if (/^o[1-4][A-Za-z0-9_-]{12,}$/.test(model) && !/^o[1-4](?:-|$)/i.test(model)) return false;
+    return true;
+  }
+
   function extractModels(text) {
     const value = String(text || "");
     const labeled = [];
     const labelPattern = /(?:model|模型(?:名称|名)?|默认模型)\s*[:=：]\s*["'`]?([^\s,;，；"'`<>]+)/gi;
     for (const match of value.matchAll(labelPattern)) {
       const model = trimPunctuation(match[1]);
-      if (model) labeled.push(model);
+      if (isLikelyModelName(model)) labeled.push(model);
     }
     const urlRanges = [...value.matchAll(URL_PATTERN)].map(match => [match.index, match.index + match[0].length]);
+    const keyRanges = [...value.matchAll(/sk-[A-Za-z0-9._-]{8,}/g)].map(match => [match.index, match.index + match[0].length]);
     const known = [...value.matchAll(MODEL_PATTERN)]
       .filter(match => !urlRanges.some(([start, end]) => match.index >= start && match.index < end))
-      .map(match => /^grok4\.5$/i.test(match[0]) ? "grok-4.5" : match[0]);
+      .filter(match => !keyRanges.some(([start, end]) => match.index >= start && match.index < end))
+      .map(match => /^grok4\.5$/i.test(match[0]) ? "grok-4.5" : match[0])
+      .filter(isLikelyModelName);
     return unique([...labeled, ...known]).slice(0, 20);
   }
 
@@ -139,13 +155,67 @@
     return { endpoint, apiKeys: keys, models };
   }
 
+  function parseNewApiConnectionInfo(text, sourceUrl) {
+    const value = String(text || "");
+    const toKey = candidate => {
+      const textValue = trimPunctuation(candidate);
+      if (!textValue || isMasked(textValue) || /^https?:\/\//i.test(textValue)) return "";
+      if (/^sk[-_]/i.test(textValue)) return isLikelyApiKey(textValue) ? textValue : "";
+      if (/^[A-Za-z0-9._-]{16,}$/.test(textValue)) return `sk-${textValue}`;
+      return isLikelyApiKey(textValue) ? textValue : "";
+    };
+
+    let endpoint = "";
+    let apiKey = "";
+    let model = "";
+
+    const settingsMatch = value.match(/settings=(\{[\s\S]*?\})(?:$|[&\s"'`])/i)
+      || value.match(/(\{\s*"(?:key|url)"\s*:\s*"[^"]+"\s*,\s*"(?:key|url)"\s*:\s*"[^"]+"\s*\})/i);
+    if (settingsMatch) {
+      try {
+        const settings = JSON.parse(settingsMatch[1]);
+        apiKey = toKey(settings.key || settings.apiKey || "");
+        endpoint = normalizeEndpoint(settings.url || settings.baseURL || settings.baseUrl || "");
+        model = clean(settings.model || "");
+      } catch (_error) {}
+    }
+
+    const parsed = parseLooseConfigText(value, sourceUrl);
+    apiKey = apiKey || parsed.apiKeys[0] || toKey((value.match(/sk-[A-Za-z0-9._-]{8,}/) || [])[0] || "");
+    if (!apiKey) {
+      const labeled = value.match(/(?:api\s*key|密钥|令牌|token|key)\s*[:=：]\s*["'`]?(sk-[A-Za-z0-9._-]+|[A-Za-z0-9._-]{16,})/i);
+      if (labeled) apiKey = toKey(labeled[1]);
+    }
+
+    endpoint = endpoint || parsed.endpoint || "";
+    if (!endpoint) {
+      const labeledUrl = value.match(/(?:base\s*url|api\s*url|接口地址|地址|url|endpoint)\s*[:=：]\s*["'`]?(https?:\/\/[^\s"'`，,;]+)/i);
+      if (labeledUrl) endpoint = normalizeEndpoint(labeledUrl[1]);
+    }
+    if (!endpoint) {
+      endpoint = extractUrls(value).map(normalizeEndpoint).filter(Boolean)
+        .find(url => !/nextchat|lobehub|lobechat|opencat|botgem/i.test(url)) || "";
+    }
+    if (endpoint && /nextchat|lobehub|lobechat|opencat|botgem/i.test(endpoint)) endpoint = "";
+
+    if (!model) model = parsed.models[0] || "";
+    if (!model) {
+      const labeledModel = value.match(/(?:model|模型)\s*[:=：]\s*["'`]?([^\s,;，；"'`<>]+)/i);
+      if (labeledModel) model = trimPunctuation(labeledModel[1]);
+    }
+    // Drop key-body false positives (e.g. o3pNAUzd... inside sk-...).
+    if (model && (!isLikelyModelName(model) || (apiKey && apiKey.includes(model)))) model = "";
+
+    return { endpoint, apiKey, model };
+  }
+
   function mergeNewApiCopiedInfo(config, copiedText, sourceUrl) {
-    const parsed = parseLooseConfigText(copiedText, sourceUrl);
+    const parsed = parseNewApiConnectionInfo(copiedText, sourceUrl);
     return {
       ...config,
       endpoint: parsed.endpoint || config?.endpoint || "",
-      apiKey: parsed.apiKeys[0] || config?.apiKey || "",
-      model: parsed.models[0] || config?.model || ""
+      apiKey: parsed.apiKey || config?.apiKey || "",
+      model: parsed.model || config?.model || ""
     };
   }
 
@@ -176,11 +246,130 @@
     return headerRow ? [...headerRow.children].map(cell => clean(cell.textContent)) : [];
   }
 
+  function getRowCells(row) {
+    const cells = [...(row?.children || [])];
+    // Many NewAPI tables prepend a checkbox/selection cell with no header.
+    if (cells.length && cells[0].querySelector?.('input[type="checkbox"]') && !clean(cells[0].textContent)) {
+      return cells.slice(1);
+    }
+    return cells;
+  }
+
   function getRowCellByHeader(row, headers, matcher, fallbackIndex) {
     const index = headers.findIndex(header => matcher.test(header));
-    const cells = [...row.children];
+    const cells = getRowCells(row);
     return cells[index >= 0 ? index : fallbackIndex] || null;
   }
+
+  function isNewApiKeyHeader(header) {
+    return /(?:api\s*)?(?:密钥|key)|令牌|token/i.test(String(header || ""));
+  }
+
+  function isNewApiTokenHeaders(headers) {
+    return headers.some(isNewApiKeyHeader) && headers.some(header => /名称|name/i.test(header));
+  }
+
+  function isNewApiKeysPath(pathname) {
+    return /\/(?:keys|token|console\/token)(?:\/|$)/i.test(String(pathname || ""));
+  }
+
+
+  function normalizeNewApiKey(value) {
+    const candidate = trimPunctuation(value);
+    if (!candidate || isMasked(candidate) || /^https?:\/\//i.test(candidate)) return "";
+    if (/^sk[-_]/i.test(candidate)) return isLikelyApiKey(candidate) ? candidate : "";
+    // NewAPI stores the secret without the sk- prefix and only prefixes it when copying/using.
+    if (/^[A-Za-z0-9._-]{16,}$/.test(candidate)) return `sk-${candidate}`;
+    return isLikelyApiKey(candidate) ? candidate : "";
+  }
+
+  function readNewApiAuthHeaders() {
+    const headers = { "Content-Type": "application/json" };
+    const storage = typeof localStorage === "undefined" ? null : localStorage;
+    if (!storage) return headers;
+    const tryParse = raw => {
+      try { return raw ? JSON.parse(raw) : null; } catch (_error) { return null; }
+    };
+    const pickToken = obj => clean(obj?.token || obj?.access_token || obj?.accessToken || obj?.auth?.accessToken || obj?.auth?.access_token || obj?.user?.token || "");
+    const pickUserId = obj => obj?.user?.id ?? obj?.auth?.user?.id ?? obj?.id;
+
+    for (const key of ["user", "session", "auth"]) {
+      const parsed = tryParse(storage.getItem(key));
+      if (!parsed) continue;
+      const token = pickToken(parsed);
+      if (token && !headers.Authorization) headers.Authorization = `Bearer ${token}`;
+      const userId = pickUserId(parsed);
+      if (userId != null && !headers["New-API-User"]) headers["New-API-User"] = String(userId);
+    }
+
+    if (!headers.Authorization) {
+      for (let index = 0; index < storage.length; index += 1) {
+        const raw = storage.getItem(storage.key(index) || "");
+        if (!raw || raw.length > 5000 || raw[0] !== "{") continue;
+        const parsed = tryParse(raw);
+        const state = parsed?.state || parsed;
+        const token = pickToken(state);
+        if (!token) continue;
+        headers.Authorization = `Bearer ${token}`;
+        const userId = pickUserId(state);
+        if (userId != null) headers["New-API-User"] = String(userId);
+        break;
+      }
+    }
+    return headers;
+  }
+
+  async function fetchNewApiTokenKey(origin, tokenId, fetchImpl) {
+    const id = Number(tokenId);
+    if (!origin || !id) return "";
+    const fetchFn = fetchImpl || fetch;
+    const headers = readNewApiAuthHeaders();
+    for (const [method, url] of [
+      ["POST", `${origin}/api/token/${id}/key`],
+      ["GET", `${origin}/api/token/${id}/key`],
+      ["GET", `${origin}/api/token/${id}`]
+    ]) {
+      try {
+        const response = await fetchFn(url, { method, headers, credentials: "include" });
+        if (!response.ok) continue;
+        const payload = await response.json();
+        const full = normalizeNewApiKey(payload?.data?.key || payload?.data?.token || payload?.key || "");
+        if (full) return full;
+      } catch (_error) {}
+    }
+    return "";
+  }
+
+  async function fetchNewApiTokenKeysBatch(origin, tokenIds, fetchImpl) {
+    const ids = unique((tokenIds || []).map(Number).filter(Boolean));
+    const result = {};
+    if (!origin || !ids.length) return result;
+    const fetchFn = fetchImpl || fetch;
+    const headers = readNewApiAuthHeaders();
+    try {
+      const response = await fetchFn(`${origin}/api/token/batch/keys`, {
+        method: "POST",
+        headers,
+        credentials: "include",
+        body: JSON.stringify({ ids })
+      });
+      if (response.ok) {
+        const payload = await response.json();
+        const keys = payload?.data?.keys || payload?.keys || {};
+        for (const [id, key] of Object.entries(keys)) {
+          const full = normalizeNewApiKey(key);
+          if (full) result[Number(id)] = full;
+        }
+      }
+    } catch (_error) {}
+    const missing = ids.filter(id => !result[id]);
+    for (const id of missing) {
+      const full = await fetchNewApiTokenKey(origin, id, fetchFn);
+      if (full) result[id] = full;
+    }
+    return result;
+  }
+
 
   function extractNewApiRows(doc, sourceUrl) {
     const origin = (() => {
@@ -189,26 +378,36 @@
     const result = [];
     for (const table of doc.querySelectorAll("table")) {
       const headers = getHeaderTexts(table);
-      if (!headers.some(header => /api\s*密钥|api\s*key/i.test(header))) continue;
+      if (!isNewApiTokenHeaders(headers)) continue;
       const rows = table.querySelectorAll("tbody tr").length
         ? [...table.querySelectorAll("tbody tr")]
         : [...table.querySelectorAll("tr")].slice(1);
       rows.forEach((row, index) => {
-        const nameCell = getRowCellByHeader(row, headers, /名称|name/i, 1);
-        const keyCell = getRowCellByHeader(row, headers, /api\s*密钥|api\s*key/i, 3);
-        const modelCell = getRowCellByHeader(row, headers, /模型|model/i, 6);
-        const statusCell = getRowCellByHeader(row, headers, /状态|status/i, 2);
+        const idCell = getRowCellByHeader(row, headers, /^(?:id|#)$/i, 0);
+        const nameCell = getRowCellByHeader(row, headers, /名称|name/i, 0);
+        const keyCell = getRowCellByHeader(row, headers, /(?:api\s*)?(?:密钥|key)|令牌|token/i, 4);
+        const modelCell = getRowCellByHeader(row, headers, /可用模型|模型|model/i, 5);
+        const statusCell = getRowCellByHeader(row, headers, /状态|status/i, 1);
+        const rawIdText = clean(idCell?.textContent);
+        const nameText = clean(nameCell?.textContent);
+        const tokenId = /^\d+$/.test(rawIdText) ? Number(rawIdText) : (/^\d+$/.test(nameText) ? Number(nameText) : 0);
         const apiKey = getElementCandidates(keyCell)[0] || "";
-        const name = clean(nameCell?.textContent) || `NewAPI ${index + 1}`;
+        let name = clean(nameCell?.textContent);
+        if (!name || /^\d+$/.test(name) || isMasked(name) || /^sk[-_]/i.test(name)) {
+          name = tokenId ? `令牌 ${tokenId}` : `NewAPI ${index + 1}`;
+        }
         const modelText = clean(modelCell?.textContent);
+        const models = extractModels(modelText).filter(isLikelyModelName);
         result.push({
-          id: `${index}-${name}`,
+          id: tokenId ? `token-${tokenId}` : `${index}-${name}`,
+          tokenId,
           name,
           endpoint: origin,
           apiKey,
-          model: extractModels(modelText)[0] || "",
+          model: models[0] || "",
           status: clean(statusCell?.textContent),
           keyCell,
+          rowEl: row,
           needsClipboard: !apiKey
         });
       });
@@ -347,14 +546,24 @@
     extractBase64Tokens,
     extractKeys,
     extractModels,
+    isNewApiKeyHeader,
+    isNewApiTokenHeaders,
+    isNewApiKeysPath,
     extractNewApiRows,
+    fetchNewApiTokenKeysBatch,
+    fetchNewApiTokenKey,
+    normalizeNewApiKey,
+    getHeaderTexts,
+    getRowCells,
     extractUrls,
     getElementCandidates,
     inferFallbackModel,
     isLikelyApiKey,
+    isLikelyModelName,
     makeConfigName,
     maskSecret,
     mergeNewApiCopiedInfo,
+    parseNewApiConnectionInfo,
     needsWidgetRemount,
     normalizeEndpoint,
     parseLooseConfigText,
