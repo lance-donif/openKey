@@ -2,7 +2,9 @@
   "use strict";
 
   const CORE = globalThis.OpenKeyCore;
+  const NEW_API = globalThis.OpenKeyNewApi;
   const widgets = new Map();
+  let pageObserver = null;
   const WIDGET_STYLE = `
     :host { all: initial; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     :host(.anchored) { position: relative; display: block; width: auto; margin: 8px 0 0; z-index: 2147483645; }
@@ -166,14 +168,33 @@
     return widget;
   }
 
+  function contextInvalid(error) {
+    return !chrome.runtime?.id || /Extension context invalidated/i.test(String(error?.message || error || ""));
+  }
+
+  async function sendRuntimeMessage(message) {
+    if (!chrome.runtime?.id) {
+      pageObserver?.disconnect();
+      return null;
+    }
+    try {
+      return await chrome.runtime.sendMessage(message);
+    } catch (error) {
+      if (!contextInvalid(error)) throw error;
+      pageObserver?.disconnect();
+      return null;
+    }
+  }
+
   async function getPendingImport() {
-    const result = await chrome.runtime.sendMessage({ type: "GET_PENDING_IMPORT" });
+    const result = await sendRuntimeMessage({ type: "GET_PENDING_IMPORT" });
     return result?.pending || null;
   }
 
   function configItemHtml(config, index, options = {}) {
     const manualKey = config.apiKey ? "" : `<div class="field"><label>API Key（未自动识别，可手工补充）</label><input type="password" data-manual-key="${index}" placeholder="粘贴 API Key 或 Base64"><label class="check"><input type="checkbox" data-manual-key-base64="${index}">输入内容是 Base64 编码</label></div>`;
-    return `<div class="item"><div class="item-top"><input type="checkbox" data-config-check="${index}" ${options.checked === false ? "" : "checked"}><div><div class="item-title">${escapeHtml(config.name || `配置 ${index + 1}`)}</div><div class="item-meta">地址：${escapeHtml(config.endpoint || "未识别")}<br>Key：${escapeHtml(CORE.maskSecret(config.apiKey))}<br>模型：${escapeHtml(config.model || "未识别")}</div></div></div>${manualKey}</div>`;
+    const modelLine = options.hideModel ? "" : `<br>模型：${escapeHtml(config.model || "未识别")}`;
+    return `<div class="item"><div class="item-top"><input type="checkbox" data-config-check="${index}" ${options.checked === false ? "" : "checked"}><div><div class="item-title">${escapeHtml(config.name || `配置 ${index + 1}`)}</div><div class="item-meta">地址：${escapeHtml(config.endpoint || "未识别")}<br>Key：${escapeHtml(CORE.maskSecret(config.apiKey))}${modelLine}</div></div></div>${manualKey}</div>`;
   }
 
   function escapeHtml(value) {
@@ -191,180 +212,6 @@
     });
   }
 
-  async function readClipboardText() {
-    try {
-      return (await navigator.clipboard?.readText?.())?.trim() || "";
-    } catch (_error) {
-      return "";
-    }
-  }
-
-  async function waitForClipboardChange(before, timeout = 2000) {
-    const start = Date.now();
-    while (Date.now() - start < timeout) {
-      const current = await readClipboardText();
-      if (current && current !== before) return current;
-      await sleep(80);
-    }
-    return "";
-  }
-
-  function nodeLabel(node) {
-    return normalizeText([
-      node?.getAttribute?.("aria-label"),
-      node?.getAttribute?.("title"),
-      node?.getAttribute?.("data-testid"),
-      node?.getAttribute?.("class"),
-      node?.innerText,
-      node?.textContent
-    ].filter(Boolean).join(" "));
-  }
-
-  function isDestructiveControl(node) {
-    return /删除|delete|移除|remove|禁用|disable|编辑|edit|聊天|chat/i.test(nodeLabel(node));
-  }
-
-  function findOpenMenuItems() {
-    const roots = [
-      ...document.querySelectorAll('[role="menu"], [role="listbox"], .semi-dropdown, .ant-dropdown, [class*="dropdown-menu"], [class*="Dropdown"]')
-    ].filter(visible);
-    const scopes = roots.length ? roots : [document];
-    const selectors = [
-      '[role="menuitem"]',
-      '[role="option"]',
-      '.semi-dropdown-item',
-      '.ant-dropdown-menu-item',
-      'li'
-    ];
-    const items = [];
-    const seen = new Set();
-    for (const root of scopes) {
-      for (const selector of selectors) {
-        for (const node of root.querySelectorAll(selector)) {
-          if (seen.has(node) || !visible(node) || isDestructiveControl(node)) continue;
-          seen.add(node);
-          items.push(node);
-        }
-      }
-    }
-    return items;
-  }
-
-  function findMenuItem(labels) {
-    const expected = (Array.isArray(labels) ? labels : [labels]).map(normalizeText).filter(Boolean);
-    if (!expected.length) return null;
-    // Prefer exact/full-phrase matches only; never partial-match short labels like "复制".
-    return findOpenMenuItems().find(item => {
-      const text = nodeLabel(item);
-      if (!text || isDestructiveControl(item)) return false;
-      return expected.some(label => text === label || (label.length >= 4 && text.includes(label)));
-    }) || null;
-  }
-
-  function findKeyCopyTrigger(row) {
-    const root = row?.keyCell;
-    if (!root) return null;
-    let best = null;
-    let bestScore = 0;
-    for (const node of root.querySelectorAll("button, [role='button'], a, span, div, i, svg")) {
-      if (!visible(node) || getComputedStyle(node).pointerEvents === "none") continue;
-      const candidate = node.closest("button, [role='button'], a, [class*='semi-button'], [class*='dropdown']") || node;
-      if (isDestructiveControl(candidate)) continue;
-      const label = nodeLabel(candidate).toLowerCase();
-      let score = 0;
-      if (/复制连接信息|复制链接信息|copy connection|copy link/.test(label)) score += 100;
-      if (/复制密钥|copy api key|copy key|copy token/.test(label)) score += 80;
-      if (/复制|copy|clipboard|icon-copy|semi-icons-copy|lucide-copy/.test(label)) score += 60;
-      if (candidate.getAttribute?.("aria-haspopup")) score += 20;
-      if (/eye|visible|查看|显示/.test(label)) score -= 50;
-      const rect = candidate.getBoundingClientRect?.();
-      if (rect && rect.width > 0 && rect.width <= 36 && rect.height <= 36) score += 15;
-      // Key-cell icon buttons without text still count if they look like copy triggers.
-      if (!label && rect && rect.width <= 36 && rect.height <= 36) score += 25;
-      if (score > bestScore) {
-        best = candidate;
-        bestScore = score;
-      }
-    }
-    return bestScore >= 25 ? best : null;
-  }
-
-  async function dismissOpenMenus() {
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-    await sleep(60);
-  }
-
-  async function copyNewApiMenuText(row, labels) {
-    // ONLY the key-column copy control. Never touch row actions (删除/编辑/禁用).
-    const menuButton = findKeyCopyTrigger(row);
-    if (!menuButton) return "";
-
-    const before = await readClipboardText();
-    await dismissOpenMenus();
-    menuButton.click();
-    const menuItem = await waitFor(() => findMenuItem(labels), 2500);
-    if (!menuItem) {
-      const direct = await waitForClipboardChange(before, 500);
-      await dismissOpenMenus();
-      return direct;
-    }
-    if (isDestructiveControl(menuItem)) {
-      await dismissOpenMenus();
-      return "";
-    }
-    menuItem.click();
-    const text = await waitForClipboardChange(before, 2000);
-    await dismissOpenMenus();
-    return text;
-  }
-
-  async function collectNewApiConfigs() {
-    const rows = CORE.extractNewApiRows(document, location.href);
-    const origin = location.origin;
-    // Prefer API unmask first — no risk of clicking 删除.
-    const missingIds = rows.filter(row => !row.apiKey && row.tokenId).map(row => row.tokenId);
-    let keyMap = {};
-    if (missingIds.length) {
-      keyMap = await CORE.fetchNewApiTokenKeysBatch(origin, missingIds);
-    }
-    for (const row of rows) {
-      if (!row.apiKey && row.tokenId && keyMap[row.tokenId]) {
-        row.apiKey = keyMap[row.tokenId];
-      }
-      if (!row.apiKey && row.tokenId) {
-        row.apiKey = await CORE.fetchNewApiTokenKey(origin, row.tokenId);
-      }
-      // Clipboard only if API still failed; key-column copy icon only.
-      if (!row.apiKey || !row.endpoint || row.endpoint === origin) {
-        const connectionInfo = await copyNewApiMenuText(row, [
-          "复制连接信息",
-          "复制链接信息",
-          "Copy Connection Info",
-          "Copy Link Info"
-        ]);
-        if (connectionInfo) {
-          Object.assign(row, CORE.mergeNewApiCopiedInfo(row, connectionInfo, location.href));
-        }
-      }
-      if (!row.apiKey) {
-        const copiedKey = await copyNewApiMenuText(row, ["复制密钥", "Copy API Key", "复制令牌", "Copy Token"]);
-        if (copiedKey) Object.assign(row, CORE.mergeNewApiCopiedInfo(row, copiedKey, location.href));
-      }
-      if (!row.endpoint) row.endpoint = origin;
-      row.keyCell = undefined;
-      row.rowEl = undefined;
-    }
-    return rows.map(row => ({
-      id: row.id,
-      name: row.name,
-      endpoint: row.endpoint || origin,
-      apiKey: row.apiKey,
-      model: row.model || "",
-      source: location.href,
-      needsManualKey: !row.apiKey
-    }));
-  }
-
   async function initNewApiPage() {
     const hasApiKeyTable = [...document.querySelectorAll("table")].some(table => CORE.isNewApiTokenHeaders(CORE.getHeaderTexts(table)));
     if (!CORE.isNewApiKeysPath(location.pathname) || !hasApiKeyTable) return;
@@ -378,12 +225,12 @@
     widget.onAction = async () => {
       widget.setBusy(true);
       try {
-        const configs = await collectNewApiConfigs();
+        const configs = await NEW_API.collect();
         if (!configs.length) {
           widget.open("没有发现 API Key 列表", `<div class="warning">请确认当前页面是 NewAPI 的 API 密钥列表页，并等待列表加载完成。</div>`, [{ label: "关闭", onClick: () => widget.close(), primary: true }]);
           return;
         }
-        widget.open("选择要导入的配置", `<div class="notice">选中后会直接创建 Sub2API 账号，再清除所有模型、同步上游全量模型，最后加入“白嫖”分组。</div>${configs.map((config, index) => configItemHtml(config, index)).join("")}`, [
+        widget.open("选择要导入的配置", `<div class="notice">选中后会直接创建 Sub2API 账号，再清除所有模型、同步上游全量模型，最后加入“白嫖”分组。</div>${configs.map((config, index) => configItemHtml(config, index, { hideModel: true })).join("")}`, [
           { label: "取消", onClick: () => widget.close() },
           { label: "直接导入 Sub2API", primary: true, onClick: async button => {
             const selected = getSelectedConfigs(widget.shadow, configs);
@@ -393,7 +240,7 @@
               return;
             }
             button.disabled = true;
-            const result = await chrome.runtime.sendMessage({ type: "SAVE_SUB2API_IMPORT", configs: selected });
+            const result = await sendRuntimeMessage({ type: "SAVE_SUB2API_IMPORT", configs: selected });
             if (!result?.ok) {
               widget.body.insertAdjacentHTML("afterbegin", `<div class="warning">开始直接导入失败：${escapeHtml(result?.error || "未知错误")}</div>`);
               button.disabled = false;
@@ -411,7 +258,7 @@
   }
 
   async function updatePendingConfigs(configs) {
-    const result = await chrome.runtime.sendMessage({ type: "UPDATE_PENDING_IMPORT", configs });
+    const result = await sendRuntimeMessage({ type: "UPDATE_PENDING_IMPORT", configs });
     if (!result?.ok) throw new Error(result?.error || "更新待导入配置失败");
   }
 
@@ -675,7 +522,7 @@
             }
             button.disabled = true;
             for (const config of selected) {
-              const result = await chrome.runtime.sendMessage({ type: "OPEN_CCSWITCH_LINK", url: CORE.buildCcSwitchLink(config, app) });
+              const result = await sendRuntimeMessage({ type: "OPEN_CCSWITCH_LINK", url: CORE.buildCcSwitchLink(config, app) });
               if (!result?.ok) {
                 widget.body.insertAdjacentHTML("afterbegin", `<div class="warning">打开 CC Switch 失败：${escapeHtml(result?.error || "未知错误")}</div>`);
                 break;
@@ -696,17 +543,21 @@
   }
 
   function init() {
+    if (!chrome.runtime?.id) {
+      pageObserver?.disconnect();
+      return;
+    }
     initNewApiPage();
     if (location.hostname === "linux.do") initLinuxDoPage();
     initSub2ApiPage();
   }
 
   let queued = false;
-  const observer = new MutationObserver(() => {
+  pageObserver = new MutationObserver(() => {
     if (queued) return;
     queued = true;
     requestAnimationFrame(() => { queued = false; init(); });
   });
-  observer.observe(document.documentElement, { childList: true, subtree: true });
+  pageObserver.observe(document.documentElement, { childList: true, subtree: true });
   init();
 })();

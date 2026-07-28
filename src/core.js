@@ -23,7 +23,7 @@
   }
 
   function isMasked(value) {
-    return /[*•…]/.test(clean(value));
+    return /[*•…]|\.\.\./.test(clean(value));
   }
 
   function isLikelyApiKey(value) {
@@ -34,7 +34,20 @@
     if (/^https?:\/\//i.test(candidate)) {
       return false;
     }
-    return KEY_PREFIX_TEST_PATTERN.test(candidate) || /^[A-Za-z0-9._-]{20,}$/.test(candidate);
+    if (KEY_PREFIX_TEST_PATTERN.test(candidate)) return true;
+    if (!/^[A-Za-z0-9._-]{20,}$/.test(candidate)) return false;
+    // URL-safe base64 blobs can look like bare keys; leave those to extractBase64Tokens.
+    if (candidate.length >= 24) {
+      const decoded = decodeBase64(candidate);
+      if (decoded) {
+        const plain = trimPunctuation(decoded);
+        if (/https?:\/\//i.test(decoded)) return false;
+        if (KEY_PREFIX_TEST_PATTERN.test(plain)) return false;
+        if (/^[A-Za-z0-9._-]{16,}$/.test(plain) && plain !== candidate) return false;
+        if (/(?:api[_ -]?key|密钥|令牌|token|key|base\s*url|endpoint|model)\s*[:=：]/i.test(decoded)) return false;
+      }
+    }
+    return true;
   }
 
   function extractUrls(text) {
@@ -83,6 +96,15 @@
     for (const match of value.matchAll(KEY_PREFIX_PATTERN)) {
       if (isLikelyApiKey(match[0])) keys.push(trimPunctuation(match[0]));
     }
+    const urlRanges = [...value.matchAll(URL_PATTERN)].map(match => [match.index, match.index + match[0].length]);
+    // Many shared keys are bare tokens without sk- / gsk_ prefixes.
+    const barePattern = /(?:^|[^A-Za-z0-9._-])([A-Za-z0-9._-]{20,})(?=$|[^A-Za-z0-9._-])/g;
+    for (const match of value.matchAll(barePattern)) {
+      const start = match.index + match[0].length - match[1].length;
+      if (urlRanges.some(([from, to]) => start >= from && start < to)) continue;
+      const candidate = trimPunctuation(match[1]);
+      if (isLikelyApiKey(candidate)) keys.push(candidate);
+    }
     return unique(keys);
   }
 
@@ -110,13 +132,14 @@
 
   function extractBase64Tokens(text) {
     const tokens = [];
-    const value = String(text || "");
+    // Discourse wraps long base64 across lines (often leaving "= / A=" on the next line).
+    const value = String(text || "").replace(/([A-Za-z0-9+/=_-])[ \t]*[\r\n]+[ \t]*(?=[A-Za-z0-9+/=_-])/g, "$1");
     const tokenPattern = /(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{24,}={0,2})(?=$|[^A-Za-z0-9+/_-])/g;
     for (const match of value.matchAll(tokenPattern)) {
       const decoded = decodeBase64(match[1]);
       if (decoded && (/https?:\/\//i.test(decoded) || isLikelyApiKey(decoded))) tokens.push(decoded);
     }
-    return tokens;
+    return unique(tokens);
   }
 
   function resolveManualApiKey(value, isBase64Encoded) {
@@ -246,10 +269,11 @@
     return headerRow ? [...headerRow.children].map(cell => clean(cell.textContent)) : [];
   }
 
-  function getRowCells(row) {
+  function getRowCells(row, headers = []) {
     const cells = [...(row?.children || [])];
     // Many NewAPI tables prepend a checkbox/selection cell with no header.
     if (cells.length && cells[0].querySelector?.('input[type="checkbox"]') && !clean(cells[0].textContent)) {
+      if (headers.length === cells.length && !clean(headers[0])) return cells;
       return cells.slice(1);
     }
     return cells;
@@ -257,7 +281,7 @@
 
   function getRowCellByHeader(row, headers, matcher, fallbackIndex) {
     const index = headers.findIndex(header => matcher.test(header));
-    const cells = getRowCells(row);
+    const cells = getRowCells(row, headers);
     return cells[index >= 0 ? index : fallbackIndex] || null;
   }
 
@@ -273,7 +297,6 @@
     return /\/(?:keys|token|console\/token)(?:\/|$)/i.test(String(pathname || ""));
   }
 
-
   function normalizeNewApiKey(value) {
     const candidate = trimPunctuation(value);
     if (!candidate || isMasked(candidate) || /^https?:\/\//i.test(candidate)) return "";
@@ -284,90 +307,76 @@
   }
 
   function readNewApiAuthHeaders() {
+    // NewAPI (incl. achai /keys) uses cookie session + New-Api-User from localStorage.uid.
+    // Do NOT invent Bearer tokens from random localStorage JSON — that breaks cookie auth.
     const headers = { "Content-Type": "application/json" };
     const storage = typeof localStorage === "undefined" ? null : localStorage;
     if (!storage) return headers;
     const tryParse = raw => {
       try { return raw ? JSON.parse(raw) : null; } catch (_error) { return null; }
     };
-    const pickToken = obj => clean(obj?.token || obj?.access_token || obj?.accessToken || obj?.auth?.accessToken || obj?.auth?.access_token || obj?.user?.token || "");
-    const pickUserId = obj => obj?.user?.id ?? obj?.auth?.user?.id ?? obj?.id;
+    const pickUserId = obj => obj?.user?.id ?? obj?.auth?.user?.id ?? obj?.id ?? null;
+    const pickToken = obj => clean(
+      obj?.token || obj?.access_token || obj?.accessToken || obj?.user?.token || ""
+    );
+
+    const uid = clean(storage.getItem("uid") || "");
+    if (uid) {
+      headers["New-Api-User"] = uid;
+    }
 
     for (const key of ["user", "session", "auth"]) {
       const parsed = tryParse(storage.getItem(key));
       if (!parsed) continue;
-      const token = pickToken(parsed);
-      if (token && !headers.Authorization) headers.Authorization = `Bearer ${token}`;
-      const userId = pickUserId(parsed);
-      if (userId != null && !headers["New-API-User"]) headers["New-API-User"] = String(userId);
-    }
-
-    if (!headers.Authorization) {
-      for (let index = 0; index < storage.length; index += 1) {
-        const raw = storage.getItem(storage.key(index) || "");
-        if (!raw || raw.length > 5000 || raw[0] !== "{") continue;
-        const parsed = tryParse(raw);
-        const state = parsed?.state || parsed;
-        const token = pickToken(state);
-        if (!token) continue;
-        headers.Authorization = `Bearer ${token}`;
-        const userId = pickUserId(state);
-        if (userId != null) headers["New-API-User"] = String(userId);
-        break;
+      const userId = pickUserId(parsed) ?? pickUserId(parsed.user || {}) ?? pickUserId(parsed.state || {});
+      if (userId != null && !headers["New-Api-User"]) {
+        headers["New-Api-User"] = String(userId);
       }
+      // Only attach Bearer when the known auth object actually has a token field.
+      const token = pickToken(parsed) || pickToken(parsed.user || {}) || pickToken(parsed.state || {});
+      if (token && !headers.Authorization) headers.Authorization = `Bearer ${token}`;
     }
     return headers;
   }
 
-  async function fetchNewApiTokenKey(origin, tokenId, fetchImpl) {
+  async function fetchNewApiTokenKey(origin, tokenId, fetchImpl, options = {}) {
     const id = Number(tokenId);
     if (!origin || !id) return "";
     const fetchFn = fetchImpl || fetch;
     const headers = readNewApiAuthHeaders();
-    for (const [method, url] of [
-      ["POST", `${origin}/api/token/${id}/key`],
-      ["GET", `${origin}/api/token/${id}/key`],
-      ["GET", `${origin}/api/token/${id}`]
-    ]) {
-      try {
-        const response = await fetchFn(url, { method, headers, credentials: "include" });
-        if (!response.ok) continue;
-        const payload = await response.json();
-        const full = normalizeNewApiKey(payload?.data?.key || payload?.data?.token || payload?.key || "");
-        if (full) return full;
-      } catch (_error) {}
-    }
-    return "";
-  }
-
-  async function fetchNewApiTokenKeysBatch(origin, tokenIds, fetchImpl) {
-    const ids = unique((tokenIds || []).map(Number).filter(Boolean));
-    const result = {};
-    if (!origin || !ids.length) return result;
-    const fetchFn = fetchImpl || fetch;
-    const headers = readNewApiAuthHeaders();
     try {
-      const response = await fetchFn(`${origin}/api/token/batch/keys`, {
+      const response = await fetchFn(`${origin}/api/token/${id}/key`, {
         method: "POST",
         headers,
         credentials: "include",
-        body: JSON.stringify({ ids })
+        signal: options.signal
       });
-      if (response.ok) {
-        const payload = await response.json();
-        const keys = payload?.data?.keys || payload?.keys || {};
-        for (const [id, key] of Object.entries(keys)) {
-          const full = normalizeNewApiKey(key);
-          if (full) result[Number(id)] = full;
-        }
-      }
+      if (!response.ok) return "";
+      const payload = await response.json();
+      return normalizeNewApiKey(payload?.data?.key || payload?.data?.token || payload?.key || "");
     } catch (_error) {}
-    const missing = ids.filter(id => !result[id]);
-    for (const id of missing) {
-      const full = await fetchNewApiTokenKey(origin, id, fetchFn);
-      if (full) result[id] = full;
-    }
-    return result;
+    return "";
+  }
+
+  async function fetchNewApiTokenList(origin, fetchImpl, options = {}) {
+    if (!origin) return [];
+    const fetchFn = fetchImpl || fetch;
+    const url = new URL("/api/token/", origin);
+    url.searchParams.set("p", "1");
+    url.searchParams.set("size", String(options.size || 100));
+    try {
+      const response = await fetchFn(url.toString(), {
+        method: "GET",
+        headers: readNewApiAuthHeaders(),
+        credentials: "include",
+        signal: options.signal
+      });
+      if (!response.ok) return [];
+      const payload = await response.json();
+      const items = payload?.data?.items || payload?.data;
+      return Array.isArray(items) ? items : [];
+    } catch (_error) {}
+    return [];
   }
 
 
@@ -390,8 +399,22 @@
         const statusCell = getRowCellByHeader(row, headers, /状态|status/i, 1);
         const rawIdText = clean(idCell?.textContent);
         const nameText = clean(nameCell?.textContent);
-        const tokenId = /^\d+$/.test(rawIdText) ? Number(rawIdText) : (/^\d+$/.test(nameText) ? Number(nameText) : 0);
+        const attrId = clean(
+          row.getAttribute?.("data-row-key")
+          || row.getAttribute?.("data-key")
+          || row.getAttribute?.("data-id")
+          || row.dataset?.rowKey
+          || row.dataset?.id
+          || ""
+        );
+        const tokenId = (
+          /^\d+$/.test(rawIdText) ? Number(rawIdText)
+          : (/^\d+$/.test(nameText) ? Number(nameText)
+          : (/^\d+$/.test(attrId) ? Number(attrId) : 0))
+        );
+        const keyText = clean(keyCell?.textContent);
         const apiKey = getElementCandidates(keyCell)[0] || "";
+        if (!nameText && !keyText && !attrId) return;
         let name = clean(nameCell?.textContent);
         if (!name || /^\d+$/.test(name) || isMasked(name) || /^sk[-_]/i.test(name)) {
           name = tokenId ? `令牌 ${tokenId}` : `NewAPI ${index + 1}`;
@@ -401,9 +424,11 @@
         result.push({
           id: tokenId ? `token-${tokenId}` : `${index}-${name}`,
           tokenId,
+          rawName: nameText,
           name,
           endpoint: origin,
           apiKey,
+          maskedKey: keyText,
           model: models[0] || "",
           status: clean(statusCell?.textContent),
           keyCell,
@@ -428,14 +453,20 @@
     }
 
     const parsedSegments = [];
-    for (const segment of unique(segments)) {
-      const parsed = parseLooseConfigText(segment, sourceUrl);
-      parsedSegments.push(parsed);
-      const decoded = decodeBase64(segment);
-      if (decoded) parsedSegments.push(parseLooseConfigText(decoded, sourceUrl));
-      for (const decodedToken of extractBase64Tokens(segment)) {
-        parsedSegments.push(parseLooseConfigText(decodedToken, sourceUrl));
+    const pushDecoded = decoded => {
+      if (!decoded) return;
+      const parsed = parseLooseConfigText(decoded, sourceUrl);
+      const whole = trimPunctuation(decoded);
+      // Decoded payload is often a bare token without sk-/labels.
+      if (isLikelyApiKey(whole) && !parsed.apiKeys.includes(whole)) {
+        parsed.apiKeys = unique([...parsed.apiKeys, whole]);
       }
+      parsedSegments.push(parsed);
+    };
+    for (const segment of unique(segments)) {
+      parsedSegments.push(parseLooseConfigText(segment, sourceUrl));
+      pushDecoded(decodeBase64(segment));
+      for (const decodedToken of extractBase64Tokens(segment)) pushDecoded(decodedToken);
     }
 
     const endpointCandidates = unique(parsedSegments.map(item => item.endpoint).filter(Boolean));
@@ -481,9 +512,18 @@
     }
   }
 
+  function makeEndpointAccountName(endpoint, fallback = "") {
+    // Prefer an already-built full page URL name; else the endpoint URL.
+    const fb = clean(fallback);
+    if (/^https?:\/\//i.test(fb)) return fb.replace(/\/$/, "");
+    const url = normalizeEndpoint(endpoint) || clean(endpoint);
+    if (url) return url.replace(/\/$/, "");
+    return fb || "OpenKey Provider";
+  }
+
   function buildSub2ApiAccount(config, groupId) {
     return {
-      name: clean(config?.name) || "OpenKey Provider",
+      name: makeEndpointAccountName(config?.endpoint, config?.name),
       notes: "",
       platform: "openai",
       type: "apikey",
@@ -503,9 +543,10 @@
   }
 
   function buildSub2ApiUiImportPlan(config) {
+    const endpoint = normalizeEndpoint(config?.endpoint) || clean(config?.endpoint);
     return {
-      name: clean(config?.name) || "OpenKey Provider",
-      endpoint: normalizeEndpoint(config?.endpoint) || clean(config?.endpoint),
+      name: makeEndpointAccountName(endpoint, config?.name),
+      endpoint,
       apiKey: clean(config?.apiKey),
       platformLabel: "OpenAI",
       typeLabel: "API Key",
@@ -550,8 +591,9 @@
     isNewApiTokenHeaders,
     isNewApiKeysPath,
     extractNewApiRows,
-    fetchNewApiTokenKeysBatch,
+    readNewApiAuthHeaders,
     fetchNewApiTokenKey,
+    fetchNewApiTokenList,
     normalizeNewApiKey,
     getHeaderTexts,
     getRowCells,
@@ -561,6 +603,7 @@
     isLikelyApiKey,
     isLikelyModelName,
     makeConfigName,
+    makeEndpointAccountName,
     maskSecret,
     mergeNewApiCopiedInfo,
     parseNewApiConnectionInfo,
