@@ -752,10 +752,17 @@
     return currentParent !== targetParent || currentPlacement !== targetPlacement;
   }
 
+  function normalizeCcSwitchApp(app) {
+    const value = clean(app).toLowerCase();
+    if (!value) return "claude";
+    if (/^grok(?:[-_]?build)?$/.test(value)) return "grokbuild";
+    return value;
+  }
+
   function buildCcSwitchLink(config, app) {
     const query = new URLSearchParams({
       resource: "provider",
-      app: app || "claude",
+      app: normalizeCcSwitchApp(app),
       name: config.name || "OpenKey Provider"
     });
     if (config.endpoint) query.set("endpoint", config.endpoint);
@@ -805,6 +812,7 @@
     makeConfigName,
     makeEndpointAccountName,
     maskSecret,
+    normalizeCcSwitchApp,
     mergeNewApiCopiedInfo,
     parseNewApiConnectionInfo,
     needsWidgetRemount,

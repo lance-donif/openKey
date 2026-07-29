@@ -28,6 +28,8 @@
 
 扩展会先解码 Base64，再从普通文本、代码块、链接和解码结果中识别网址、Key、模型，选择目标应用后逐条打开 CC Switch 深链接。若没有明确模型，标题/帖主正文包含 `grok` 时默认 `grok-4.5`，包含 `gpt`、`openai` 或 `chatgpt` 时默认 `gpt-5.6-sol`。CC Switch 会显示自己的导入确认界面。
 
+选择 **Grok Build** 时，扩展使用 CC Switch 官方要求的 `app=grokbuild` Provider 深链接；该功能需要 CC Switch `v3.18.0` 或更高版本。旧设置中的 `grok`、`grok-build`、`grok_build` 会自动兼容。
+
 图片里的配置无法仅靠网页 DOM 读取；遇到纯截图时请先复制为文本或用「Base64 解码」粘贴后再导入。
 
 ## 安全说明

@@ -559,11 +559,12 @@
   }
 
   function linuxDoAppSelectHtml(selectedApp = "claude") {
+    const normalizedApp = CORE.normalizeCcSwitchApp(selectedApp);
     const options = [
       ["claude", "Claude Code"],
       ["codex", "Codex"],
-      ["grok", "Grok"]
-    ].map(([value, label]) => `<option value="${value}"${value === selectedApp ? " selected" : ""}>${label}</option>`).join("");
+      ["grokbuild", "Grok Build"]
+    ].map(([value, label]) => `<option value="${value}"${value === normalizedApp ? " selected" : ""}>${label}</option>`).join("");
     return `<div class="field"><label>目标应用</label><select data-cc-app>${options}</select></div>`;
   }
 

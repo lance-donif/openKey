@@ -3,6 +3,9 @@
     sub2apiUrl: "http://localhost:8080/admin/accounts",
     ccApp: "claude"
   };
+  const normalizeCcApp = value => /^grok(?:[-_]?build)?$/i.test(String(value || ""))
+    ? "grokbuild"
+    : String(value || "claude");
   const urlInput = document.querySelector("#sub2api-url");
   const appSelect = document.querySelector("#cc-app");
   const saveButton = document.querySelector("#save");
@@ -10,7 +13,7 @@
 
   chrome.storage.local.get(DEFAULTS).then(settings => {
     urlInput.value = settings.sub2apiUrl;
-    appSelect.value = settings.ccApp;
+    appSelect.value = normalizeCcApp(settings.ccApp);
   });
 
   saveButton.addEventListener("click", async () => {
@@ -20,7 +23,7 @@
       status.className = "status error";
       return;
     }
-    await chrome.storage.local.set({ sub2apiUrl, ccApp: appSelect.value });
+    await chrome.storage.local.set({ sub2apiUrl, ccApp: normalizeCcApp(appSelect.value) });
     status.textContent = "设置已保存";
     status.className = "status success";
   });

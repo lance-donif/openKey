@@ -299,6 +299,26 @@ test("builds a CC Switch v1 provider deep link", () => {
   assert.equal(parsed.searchParams.get("apiKey"), "sk-demo_1234567890");
 });
 
+test("normalizes Grok Build aliases for CC Switch provider links", () => {
+  for (const app of ["grok", "grok-build", "grok_build", "grokbuild"]) {
+    assert.equal(core.normalizeCcSwitchApp(app), "grokbuild", app);
+    const link = core.buildCcSwitchLink({
+      name: "Grok Build Provider",
+      endpoint: "https://api.example.com/v1",
+      apiKey: "sk-grokbuild_1234567890"
+    }, app);
+    assert.equal(new URL(link).searchParams.get("app"), "grokbuild", app);
+  }
+  assert.equal(core.normalizeCcSwitchApp(""), "claude");
+  assert.equal(core.normalizeCcSwitchApp("codex"), "codex");
+});
+
+test("popup exposes the canonical Grok Build app value", () => {
+  const html = fs.readFileSync(require.resolve("../src/popup.html"), "utf8");
+  assert.match(html, /<option value="grokbuild">Grok Build<\/option>/);
+  assert.doesNotMatch(html, /<option value="grok">/);
+});
+
 test("uses topic keywords only when no explicit model exists", () => {
   assert.equal(core.inferFallbackModel("小试牛刀一下，Grok4.5 测试"), "grok-4.5");
   assert.equal(core.inferFallbackModel("GPT API 公益地址"), "gpt-5.6-sol");
