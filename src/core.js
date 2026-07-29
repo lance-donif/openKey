@@ -26,6 +26,35 @@
     return /[*•…]|\.\.\./.test(clean(value));
   }
 
+  function looksLikeBase64Blob(value) {
+    const candidate = clean(value).replace(/\s+/g, "");
+    if (candidate.length < 24) return false;
+    if (!/^[A-Za-z0-9+/=_-]+$/.test(candidate)) return false;
+    // Standard base64 markers are decisive.
+    if (/[+/=]/.test(candidate)) return true;
+    // Long encoding blocks (common in Discourse pastes) are not bare API keys.
+    if (candidate.length >= 64) return true;
+    // Medium URL-safe blobs: only treat as base64 when they actually decode to config-like text.
+    if (candidate.length >= 32) {
+      const decoded = decodeBase64(candidate);
+      if (decoded && isPrintableConfigText(decoded)) {
+        if (/https?:\/\//i.test(decoded)
+          || KEY_PREFIX_TEST_PATTERN.test(trimPunctuation(decoded))
+          || /(?:api[_ -]?key|密钥|令牌|token|key|base\s*url|endpoint|model)\s*[:=：]/i.test(decoded)
+          || extractKeys(decoded).length) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function isPrintableConfigText(value) {
+    const text = String(value || "");
+    if (!text || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(text)) return false;
+    return /[A-Za-z0-9]/.test(text);
+  }
+
   function isLikelyApiKey(value) {
     const candidate = trimPunctuation(value);
     if (!candidate || candidate.length < 8 || isMasked(candidate) || /\s/.test(candidate)) {
@@ -45,8 +74,13 @@
         if (KEY_PREFIX_TEST_PATTERN.test(plain)) return false;
         if (/^[A-Za-z0-9._-]{16,}$/.test(plain) && plain !== candidate) return false;
         if (/(?:api[_ -]?key|密钥|令牌|token|key|base\s*url|endpoint|model)\s*[:=：]/i.test(decoded)) return false;
+        if (isPrintableConfigText(decoded) && looksLikeBase64Blob(candidate)) return false;
+      } else if (looksLikeBase64Blob(candidate)) {
+        // Partial/line-wrapped base64 chunks must not become bare keys.
+        return false;
       }
     }
+    if (!KEY_PREFIX_TEST_PATTERN.test(candidate) && candidate.length > 80) return false;
     return true;
   }
 
@@ -521,43 +555,47 @@
     return result;
   }
 
-  function collectLinuxDoConfigs(doc, sourceUrl) {
-    const ownerArticle = doc.querySelector("main article") || doc.querySelector("article");
-    if (!ownerArticle) return [];
-    const segments = [];
-    const topicTitle = doc.querySelector("main h1")?.textContent || doc.querySelector("h1")?.textContent || "";
-    const ownerText = ownerArticle.innerText || ownerArticle.textContent || "";
-    if (ownerText) segments.push(ownerText);
-    for (const node of ownerArticle.querySelectorAll("pre, code, blockquote, a[href]")) {
-      const text = node.matches("a[href]") ? `${node.textContent || ""} ${node.getAttribute("href") || ""}` : node.textContent || "";
-      if (text.trim()) segments.push(text);
+  function parseLinuxDoDecodedPayload(text, sourceUrl) {
+    const decoded = String(text || "");
+    const parsed = parseLooseConfigText(decoded, sourceUrl);
+    const whole = trimPunctuation(decoded);
+    if (isLikelyApiKey(whole) && !parsed.apiKeys.includes(whole)) {
+      parsed.apiKeys = unique([...parsed.apiKeys, whole]);
     }
+    return parsed;
+  }
 
-    const parsedSegments = [];
-    const pushDecoded = decoded => {
-      if (!decoded) return;
-      const parsed = parseLooseConfigText(decoded, sourceUrl);
-      const whole = trimPunctuation(decoded);
-      // Decoded payload is often a bare token without sk-/labels.
-      if (isLikelyApiKey(whole) && !parsed.apiKeys.includes(whole)) {
-        parsed.apiKeys = unique([...parsed.apiKeys, whole]);
-      }
-      parsedSegments.push(parsed);
-    };
-    for (const segment of unique(segments)) {
-      parsedSegments.push(parseLooseConfigText(segment, sourceUrl));
-      pushDecoded(decodeBase64(segment));
-      for (const decodedToken of extractBase64Tokens(segment)) pushDecoded(decodedToken);
+  function preferLinuxDoKeys(rawKeys, decodedKeys, base64Sources = []) {
+    const decoded = unique(decodedKeys);
+    const raw = unique(rawKeys);
+    if (!decoded.length) {
+      return raw.filter(key => !looksLikeBase64Blob(key) || KEY_PREFIX_TEST_PATTERN.test(key));
     }
+    const sourceBlobs = unique(base64Sources.map(value => clean(value).replace(/\s+/g, "")).filter(Boolean));
+    const filteredRaw = raw.filter(key => {
+      if (decoded.includes(key)) return false;
+      if (KEY_PREFIX_TEST_PATTERN.test(key)) return true;
+      if (looksLikeBase64Blob(key)) return false;
+      const compact = clean(key).replace(/\s+/g, "");
+      if (sourceBlobs.some(blob => blob.includes(compact) || compact.includes(blob))) return false;
+      return true;
+    });
+    // When decoding succeeded, prefer prefixed secrets over leftover bare noise.
+    const merged = unique([...decoded, ...filteredRaw]);
+    const hasPrefixed = merged.some(key => KEY_PREFIX_TEST_PATTERN.test(key));
+    if (!hasPrefixed) return merged;
+    return merged.filter(key => KEY_PREFIX_TEST_PATTERN.test(key) || !looksLikeBase64Blob(key));
+  }
 
-    const endpointCandidates = unique(parsedSegments.map(item => item.endpoint).filter(Boolean));
-    const keyCandidates = unique(parsedSegments.flatMap(item => item.apiKeys || []));
-    const modelCandidates = unique(parsedSegments.flatMap(item => item.models || []))
+  function buildLinuxDoConfigsFromParts(parts, sourceUrl, topicTitle = "", ownerText = "") {
+    const endpointCandidates = unique(parts.map(item => item.endpoint).filter(Boolean));
+    const keyCandidates = unique(parts.flatMap(item => item.apiKeys || []));
+    const modelCandidates = unique(parts.flatMap(item => item.models || []))
       .filter(model => !/^(?:gpt|grok|openai|chatgpt|claude|gemini|deepseek|qwen|kimi|moonshot|glm|mistral|llama)$/i.test(model));
     const fallbackModel = modelCandidates[0] || inferFallbackModel(`${topicTitle}\n${ownerText}`);
     const configs = [];
     for (const key of keyCandidates) {
-      const scoped = parsedSegments.find(item => item.apiKeys?.includes(key) && item.endpoint);
+      const scoped = parts.find(item => item.apiKeys?.includes(key) && item.endpoint);
       const endpoint = scoped?.endpoint || endpointCandidates[0] || "";
       const scopedModel = scoped?.models?.find(model => !/^(?:gpt|grok|openai|chatgpt|claude|gemini|deepseek|qwen|kimi|moonshot|glm|mistral|llama)$/i.test(model));
       const model = scopedModel || fallbackModel;
@@ -582,6 +620,81 @@
       });
     }
     return configs;
+  }
+
+  function collectLinuxDoConfigsFromBase64(value, sourceUrl, extras = {}) {
+    const raw = String(value || "");
+    const compact = raw.replace(/\s+/g, "");
+    let decoded = decodeBase64(raw) || decodeBase64(compact);
+    if (!decoded) {
+      const tokens = extractBase64Tokens(raw);
+      decoded = tokens[0] || "";
+    }
+    if (!decoded) return [];
+    const parsed = parseLinuxDoDecodedPayload(decoded, sourceUrl);
+    return buildLinuxDoConfigsFromParts([parsed], sourceUrl, extras.topicTitle || "", extras.ownerText || decoded);
+  }
+
+  function collectLinuxDoConfigs(doc, sourceUrl) {
+    const ownerArticle = doc.querySelector("main article") || doc.querySelector("article");
+    if (!ownerArticle) return [];
+    const segments = [];
+    const topicTitle = doc.querySelector("main h1")?.textContent || doc.querySelector("h1")?.textContent || "";
+    const ownerText = ownerArticle.innerText || ownerArticle.textContent || "";
+    if (ownerText) segments.push(ownerText);
+    for (const node of ownerArticle.querySelectorAll("pre, code, blockquote, a[href]")) {
+      const text = node.matches("a[href]") ? `${node.textContent || ""} ${node.getAttribute("href") || ""}` : node.textContent || "";
+      if (text.trim()) segments.push(text);
+    }
+
+    const rawParts = [];
+    const decodedParts = [];
+    const base64Sources = [];
+    const pushDecoded = (decoded, sourceBlob = "") => {
+      if (!decoded) return;
+      if (sourceBlob) base64Sources.push(sourceBlob);
+      decodedParts.push(parseLinuxDoDecodedPayload(decoded, sourceUrl));
+    };
+    for (const segment of unique(segments)) {
+      rawParts.push(parseLooseConfigText(segment, sourceUrl));
+      const wholeDecoded = decodeBase64(segment);
+      if (wholeDecoded) pushDecoded(wholeDecoded, segment);
+      const joined = String(segment || "").replace(/([A-Za-z0-9+/=_-])[ \t]*[\r\n]+[ \t]*(?=[A-Za-z0-9+/=_-])/g, "$1");
+      for (const match of joined.matchAll(/(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{24,}={0,2})(?=$|[^A-Za-z0-9+/_-])/g)) {
+        const blob = match[1];
+        const decoded = decodeBase64(blob);
+        if (decoded && (/https?:\/\//i.test(decoded) || isLikelyApiKey(decoded) || isPrintableConfigText(decoded))) {
+          pushDecoded(decoded, blob);
+        }
+      }
+    }
+
+    const rawKeys = rawParts.flatMap(item => item.apiKeys || []);
+    const decodedKeys = decodedParts.flatMap(item => item.apiKeys || []);
+    const keyCandidates = preferLinuxDoKeys(rawKeys, decodedKeys, base64Sources);
+    const parts = [
+      ...decodedParts,
+      ...rawParts.map(part => ({
+        ...part,
+        apiKeys: (part.apiKeys || []).filter(key => keyCandidates.includes(key))
+      }))
+    ].map(part => ({
+      ...part,
+      apiKeys: (part.apiKeys || []).filter(key => keyCandidates.includes(key))
+    }));
+    // Ensure every surviving key still has a part entry for endpoint scoping.
+    for (const key of keyCandidates) {
+      if (!parts.some(part => part.apiKeys?.includes(key))) {
+        parts.push({
+          endpoint: rawParts.find(item => item.endpoint)?.endpoint
+            || decodedParts.find(item => item.endpoint)?.endpoint
+            || "",
+          apiKeys: [key],
+          models: []
+        });
+      }
+    }
+    return buildLinuxDoConfigsFromParts(parts, sourceUrl, topicTitle, ownerText);
   }
 
   function makeConfigName(endpoint, model, index) {
@@ -664,10 +777,14 @@
     buildSub2ApiAccount,
     buildSub2ApiUiImportPlan,
     collectLinuxDoConfigs,
+    collectLinuxDoConfigsFromBase64,
     decodeBase64,
     extractBase64Tokens,
     extractKeys,
     extractModels,
+    looksLikeBase64Blob,
+    parseLinuxDoDecodedPayload,
+    preferLinuxDoKeys,
     isNewApiKeyHeader,
     isNewApiTokenHeaders,
     isNewApiKeysPath,

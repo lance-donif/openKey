@@ -40,6 +40,11 @@
     .field label { font-size: 12px; color: #475569; }
     .field input, .field select, .field textarea { width: 100%; border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 10px; color: #0f172a; background: #fff; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .key-row { display: flex; align-items: flex-start; gap: 8px; margin: 10px 0; padding: 12px; border: 1px solid #e2e8f0; border-radius: 12px; background: #f8fafc; }
+    .key-text { flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.5; color: #0f172a; word-break: break-all; white-space: pre-wrap; }
+    .copy-key { flex: 0 0 auto; border: 1px solid #cbd5e1; border-radius: 8px; padding: 6px 10px; color: #334155; background: #fff; cursor: pointer; font-size: 12px; }
+    .copy-key:hover { background: #f1f5f9; }
+    .copy-key[data-copied="1"] { color: #166534; border-color: #86efac; background: #f0fdf4; }
     @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
   `;
 
@@ -195,6 +200,39 @@
     const manualKey = config.apiKey ? "" : `<div class="field"><label>API Key（未自动识别，可手工补充）</label><input type="password" data-manual-key="${index}" placeholder="粘贴 API Key 或 Base64"><label class="check"><input type="checkbox" data-manual-key-base64="${index}">输入内容是 Base64 编码</label></div>`;
     const modelLine = options.hideModel ? "" : `<br>模型：${escapeHtml(config.model || "未识别")}`;
     return `<div class="item"><div class="item-top"><input type="checkbox" data-config-check="${index}" ${options.checked === false ? "" : "checked"}><div><div class="item-title">${escapeHtml(config.name || `配置 ${index + 1}`)}</div><div class="item-meta">地址：${escapeHtml(config.endpoint || "未识别")}<br>Key：${escapeHtml(CORE.maskSecret(config.apiKey))}${modelLine}</div></div></div>${manualKey}</div>`;
+  }
+
+  function plainKeyRowsHtml(configs) {
+    const keys = [...new Set((configs || []).map(config => config.apiKey).filter(Boolean))];
+    if (!keys.length) return `<div class="muted">暂无可用 Key。</div>`;
+    return keys.map((key, index) => `
+      <div class="key-row">
+        <div class="key-text" data-plain-key="${index}">${escapeHtml(key)}</div>
+        <button type="button" class="copy-key" data-copy-key="${index}">复制</button>
+      </div>
+    `).join("");
+  }
+
+  function bindPlainKeyCopyButtons(root, configs) {
+    const keys = [...new Set((configs || []).map(config => config.apiKey).filter(Boolean))];
+    for (const button of root.querySelectorAll("[data-copy-key]")) {
+      button.addEventListener("click", async () => {
+        const index = Number(button.getAttribute("data-copy-key"));
+        const key = keys[index] || "";
+        if (!key) return;
+        try {
+          await navigator.clipboard.writeText(key);
+          button.dataset.copied = "1";
+          button.textContent = "已复制";
+          setTimeout(() => {
+            button.dataset.copied = "0";
+            button.textContent = "复制";
+          }, 1200);
+        } catch (_error) {
+          button.textContent = "复制失败";
+        }
+      });
+    }
   }
 
   function escapeHtml(value) {
@@ -497,51 +535,117 @@
     }
   });
 
+  async function importConfigsToCcSwitch(widget, configs, button) {
+    const selected = getSelectedConfigs(widget.shadow, configs);
+    const app = widget.shadow.querySelector("[data-cc-app]")?.value || "claude";
+    if (!selected.length || selected.some(config => !config.apiKey || !config.endpoint)) {
+      widget.body.insertAdjacentHTML("afterbegin", `<div class="warning">每条配置都需要完整网址和 API Key。</div>`);
+      return;
+    }
+    if (button) button.disabled = true;
+    try {
+      for (const config of selected) {
+        const result = await sendRuntimeMessage({ type: "OPEN_CCSWITCH_LINK", url: CORE.buildCcSwitchLink(config, app) });
+        if (!result?.ok) {
+          widget.body.insertAdjacentHTML("afterbegin", `<div class="warning">打开 CC Switch 失败：${escapeHtml(result?.error || "未知错误")}</div>`);
+          break;
+        }
+        await sleep(250);
+      }
+      await chrome.storage.local.set({ ccApp: app });
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  function linuxDoAppSelectHtml(selectedApp = "claude") {
+    const options = [
+      ["claude", "Claude Code"],
+      ["codex", "Codex"],
+      ["grok", "Grok"]
+    ].map(([value, label]) => `<option value="${value}"${value === selectedApp ? " selected" : ""}>${label}</option>`).join("");
+    return `<div class="field"><label>目标应用</label><select data-cc-app>${options}</select></div>`;
+  }
+
   async function initLinuxDoPage() {
     if (location.hostname !== "linux.do" || !location.pathname.startsWith("/t/")) return;
     const ownerArticle = document.querySelector("main article") || document.querySelector("article");
     const avatar = ownerArticle?.querySelector("img.avatar") || ownerArticle?.querySelector("img");
     const anchor = avatar?.closest?.(".topic-avatar") || avatar || document.querySelector("main h1") || findButton(document, text => text.includes("回复"));
+
     const widget = createWidget("openkey-linuxdo-widget", "导入到 CC Switch", anchor, { placement: "below-anchor" });
     widget?.mount?.(anchor, { placement: "below-anchor" });
-    if (!widget || widget.__initialized) return;
-    widget.__initialized = true;
-    widget.onAction = async () => {
-      widget.setBusy(true);
-      try {
-        const configs = CORE.collectLinuxDoConfigs(document, location.href);
-        if (!configs.length) {
-          widget.open("没有发现可导入配置", `<div class="warning">当前页面没有识别到网址或 API Key。若配置在图片中，请把图片里的配置复制为文本后再试。</div>`, [{ label: "关闭", onClick: () => widget.close(), primary: true }]);
-          return;
+    if (widget && !widget.__initialized) {
+      widget.__initialized = true;
+      widget.onAction = async () => {
+        widget.setBusy(true);
+        try {
+          const configs = CORE.collectLinuxDoConfigs(document, location.href);
+          if (!configs.length) {
+            widget.open("没有发现可导入配置", `<div class="warning">当前页面没有识别到网址或 API Key。若配置在图片中，请把图片里的配置复制为文本后再试。也可使用下方“Base64 解码”。</div>`, [{ label: "关闭", onClick: () => widget.close(), primary: true }]);
+            return;
+          }
+          const settings = await chrome.storage.local.get({ ccApp: "claude" });
+          widget.open(
+            "选择 CC Switch 导入方式",
+            `<div class="notice">CC Switch 使用 ccswitch:// 深链接导入。链接包含 API Key，只会在你点击“导入”时交给本机 CC Switch。</div>${linuxDoAppSelectHtml(settings.ccApp)}${configs.map((config, index) => configItemHtml(config, index)).join("")}`,
+            [
+              { label: "关闭", onClick: () => widget.close() },
+              { label: "导入选中配置", primary: true, onClick: button => importConfigsToCcSwitch(widget, configs, button) }
+            ]
+          );
+        } catch (error) {
+          widget.open("识别失败", `<div class="warning">${escapeHtml(error.message || "页面结构暂不兼容")}</div>`, [{ label: "关闭", onClick: () => widget.close(), primary: true }]);
+        } finally {
+          widget.setBusy(false);
         }
-        const settings = await chrome.storage.local.get({ ccApp: "claude" });
-        widget.open("选择 CC Switch 导入方式", `<div class="notice">CC Switch 使用 ccswitch:// 深链接导入。链接包含 API Key，只会在你点击“导入”时交给本机 CC Switch。</div><div class="field"><label>目标应用</label><select data-cc-app><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="grok">Grok</option></select></div>${configs.map((config, index) => configItemHtml(config, index)).join("")}`, [
-          { label: "关闭", onClick: () => widget.close() },
-          { label: "导入选中配置", primary: true, onClick: async button => {
-            const selected = getSelectedConfigs(widget.shadow, configs);
-            const app = widget.shadow.querySelector("[data-cc-app]")?.value || "claude";
-            if (!selected.length || selected.some(config => !config.apiKey || !config.endpoint)) {
-              widget.body.insertAdjacentHTML("afterbegin", `<div class="warning">每条配置都需要完整网址和 API Key。</div>`);
-              return;
-            }
-            button.disabled = true;
-            for (const config of selected) {
-              const result = await sendRuntimeMessage({ type: "OPEN_CCSWITCH_LINK", url: CORE.buildCcSwitchLink(config, app) });
-              if (!result?.ok) {
-                widget.body.insertAdjacentHTML("afterbegin", `<div class="warning">打开 CC Switch 失败：${escapeHtml(result?.error || "未知错误")}</div>`);
-                break;
-              }
-              await sleep(250);
-            }
-            button.disabled = false;
-          } }
-        ]);
-        const appSelect = widget.shadow.querySelector("[data-cc-app]");
-        if (appSelect && settings.ccApp) appSelect.value = settings.ccApp;
+      };
+    }
+
+    const b64Widget = createWidget("openkey-linuxdo-b64-widget", "Base64 解码", anchor, { placement: "below-anchor" });
+    b64Widget?.mount?.(anchor, { placement: "below-anchor" });
+    if (!b64Widget || b64Widget.__initialized) return;
+    b64Widget.__initialized = true;
+    b64Widget.onAction = async () => {
+      b64Widget.setBusy(true);
+      try {
+        const recognized = CORE.collectLinuxDoConfigs(document, location.href);
+        let decodedConfigs = [];
+        let draftInput = "";
+        const sourceConfigs = () => (decodedConfigs.length ? decodedConfigs : recognized);
+        const openPanel = () => {
+          const keys = sourceConfigs();
+          const keyBlock = keys.some(config => config.apiKey)
+            ? `<div class="notice">以下为解码/识别到的 Key（明文）。</div>${plainKeyRowsHtml(keys)}`
+            : draftInput
+              ? `<div class="warning">解码失败，或结果中没有 API Key。</div>`
+              : recognized.length
+                ? `<div class="warning">已识别到配置，但没有可用 Key。</div>`
+                : `<div class="muted">解码后的 Key 会显示在这里。</div>`;
+          b64Widget.open(
+            "Base64 解码",
+            `<div class="field"><label>Base64 输入</label><textarea data-b64-input rows="5" placeholder="粘贴 Base64（支持换行）"></textarea></div><div data-b64-result>${keyBlock}</div>`,
+            [
+              { label: "关闭", onClick: () => b64Widget.close() },
+              { label: "解码", onClick: () => {
+                draftInput = b64Widget.shadow.querySelector("[data-b64-input]")?.value || "";
+                decodedConfigs = CORE.collectLinuxDoConfigsFromBase64(draftInput, location.href);
+                openPanel();
+              } }
+            ]
+          );
+          const area = b64Widget.shadow.querySelector("[data-b64-input]");
+          if (area) {
+            area.value = draftInput;
+            area.focus();
+          }
+          bindPlainKeyCopyButtons(b64Widget.shadow, keys);
+        };
+        openPanel();
       } catch (error) {
-        widget.open("识别失败", `<div class="warning">${escapeHtml(error.message || "页面结构暂不兼容")}</div>`, [{ label: "关闭", onClick: () => widget.close(), primary: true }]);
+        b64Widget.open("解码面板失败", `<div class="warning">${escapeHtml(error.message || "未知错误")}</div>`, [{ label: "关闭", onClick: () => b64Widget.close(), primary: true }]);
       } finally {
-        widget.setBusy(false);
+        b64Widget.setBusy(false);
       }
     };
   }

@@ -167,6 +167,83 @@ test("joins line-wrapped base64 before decoding the key", () => {
 });
 
 
+test("single base64 payload yields one linux.do config without raw blob key", () => {
+  const key = "sk-0L6Po3pNAUzdPGmugh1OQxC60JJwOYuZbt3PFTaYSyd9dcdf";
+  const plain = [
+    `key: ${key}`,
+    "https://sub.yxxb.eu.cc/v1",
+    "model: gpt-5.5"
+  ].join("\n");
+  const encoded = Buffer.from(plain, "utf8").toString("base64");
+  assert.equal(core.isLikelyApiKey(encoded.replace(/=+$/, "")), false);
+  const ownerText = `64解密\n${encoded}`;
+  const ownerArticle = {
+    innerText: ownerText,
+    textContent: ownerText,
+    querySelectorAll() { return []; }
+  };
+  const doc = {
+    querySelector(sel) {
+      if (sel === "main article" || sel === "article") return ownerArticle;
+      if (sel === "main h1" || sel === "h1") return { textContent: "gpt 分享" };
+      return null;
+    }
+  };
+  const configs = core.collectLinuxDoConfigs(doc, "https://linux.do/t/topic/2670235");
+  assert.equal(configs.length, 1);
+  assert.equal(configs[0].apiKey, key);
+  assert.equal(configs[0].endpoint, "https://sub.yxxb.eu.cc/v1");
+  assert.equal(configs[0].model, "gpt-5.5");
+  assert.equal(configs.some(item => /^(?:[A-Za-z0-9+/_-]{20,}={0,2})$/.test(item.apiKey) && item.apiKey !== key), false);
+});
+
+test("collectLinuxDoConfigsFromBase64 builds importable configs", () => {
+  const key = "sk-manual_b64_decode_1234567890ab";
+  const encoded = Buffer.from(`https://relay.example.com/v1\n${key}\nmodel: gpt-4o`, "utf8").toString("base64");
+  const configs = core.collectLinuxDoConfigsFromBase64(encoded, "https://linux.do/t/topic/1");
+  assert.equal(configs.length, 1);
+  assert.equal(configs[0].apiKey, key);
+  assert.equal(configs[0].endpoint, "https://relay.example.com/v1");
+  assert.equal(configs[0].model, "gpt-4o");
+});
+
+test("prefers decoded keys over raw base64-like fragments", () => {
+  const real = "sk-real_from_decode_1234567890";
+  const blob = Buffer.from(`${real}\nhttps://api.example.com/v1`, "utf8").toString("base64");
+  const keys = core.preferLinuxDoKeys(
+    [blob.slice(0, 28), real],
+    [real],
+    [blob]
+  );
+  assert.deepEqual(keys, [real]);
+});
+
+test("keeps two plain sk keys on linux.do text", () => {
+  const ownerText = [
+    "https://api.example.com/v1",
+    "sk-first_plain_key_1234567890ab",
+    "sk-second_plain_key_1234567890ab"
+  ].join("\n");
+  const ownerArticle = {
+    innerText: ownerText,
+    textContent: ownerText,
+    querySelectorAll() { return []; }
+  };
+  const doc = {
+    querySelector(sel) {
+      if (sel === "main article" || sel === "article") return ownerArticle;
+      if (sel === "main h1" || sel === "h1") return { textContent: "双 key" };
+      return null;
+    }
+  };
+  const configs = core.collectLinuxDoConfigs(doc, "https://linux.do/t/topic/2");
+  assert.equal(configs.length, 2);
+  assert.deepEqual(configs.map(item => item.apiKey).sort(), [
+    "sk-first_plain_key_1234567890ab",
+    "sk-second_plain_key_1234567890ab"
+  ].sort());
+});
+
 test("collects line-wrapped base64 bare key with endpoint on linux.do text", () => {
   const key = "stepfunBareToken0123456789ab";
   const encodedKey = Buffer.from(key, "utf8").toString("base64");
