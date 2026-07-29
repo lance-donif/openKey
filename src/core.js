@@ -294,7 +294,10 @@
   }
 
   function isNewApiKeysPath(pathname) {
-    return /\/(?:keys|token|console\/token)(?:\/|$)/i.test(String(pathname || ""));
+    // Page routes only. Ignore query/hash and never treat /api/token as a keys UI page.
+    const path = String(pathname || "").split(/[?#]/)[0];
+    if (/\/api(?:\/|$)/i.test(path)) return false;
+    return /\/(?:keys|token|console\/token)(?:\/|$)/i.test(path);
   }
 
   function normalizeNewApiKey(value) {

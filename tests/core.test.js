@@ -5,6 +5,97 @@ const vm = require("node:vm");
 const core = require("../src/core.js");
 const newapi = require("../src/newapi.js");
 
+function makeMessageWindow() {
+  const listeners = new Set();
+  let token = "";
+  const dispatch = data => {
+    for (const listener of listeners) listener({ type: "message", data });
+  };
+  return {
+    addEventListener(type, listener) {
+      if (type === "message") listeners.add(listener);
+    },
+    removeEventListener(type, listener) {
+      if (type === "message") listeners.delete(listener);
+    },
+    postMessage(data) {
+      if (data.type === "arm") {
+        token = data.token;
+        queueMicrotask(() => dispatch({ ...data, type: "armed" }));
+      }
+      if (data.type === "disarm" && data.token === token) token = "";
+    },
+    copy(value) {
+      dispatch({
+        channel: "openkey-clipboard-v1",
+        type: "clipboard",
+        token,
+        text: value
+      });
+    },
+    get token() { return token; },
+    dispatch
+  };
+}
+
+function makeControl(label, attributes = {}, onClick = () => {}) {
+  return {
+    textContent: label,
+    hidden: false,
+    getAttribute(name) {
+      if (name === "aria-hidden") return null;
+      return attributes[name] || null;
+    },
+    getClientRects() { return [{}]; },
+    click: onClick
+  };
+}
+
+function bareRow(overrides = {}) {
+  return {
+    id: overrides.id || "row-1",
+    tokenId: overrides.tokenId || 0,
+    tokenIdSource: overrides.tokenIdSource || "",
+    rawName: overrides.rawName || "",
+    endpoint: overrides.endpoint || "https://example.test",
+    apiKey: overrides.apiKey || "",
+    maskedKey: overrides.maskedKey || "",
+    keyCell: overrides.keyCell || {
+      querySelector() { return null; },
+      querySelectorAll() { return []; }
+    },
+    rowEl: overrides.rowEl || {
+      querySelector() { return null; }
+    },
+    ...overrides
+  };
+}
+
+function emptyDoc(extra = {}) {
+  return {
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    ...extra
+  };
+}
+
+async function withExtractedRows(rows, run) {
+  const original = core.extractNewApiRows;
+  core.extractNewApiRows = () => rows;
+  try {
+    return await run();
+  } finally {
+    core.extractNewApiRows = original;
+  }
+}
+
+function selectorHas(selector, part) {
+  return String(selector || "")
+    .split(",")
+    .map(item => item.trim())
+    .some(item => item === part || item.includes(part));
+}
+
 
 test("extracts bare keys without sk- prefix next to an endpoint", () => {
   const key = "stepfunBareToken0123456789ab";
@@ -1202,4 +1293,574 @@ test("never treats destructive controls as copy candidates", () => {
     getAttribute() { return ""; }
   };
   assert.equal(newapi.isDestructiveControl(node), true);
+  assert.equal(newapi.isDestructiveControl({
+    textContent: "复制密钥",
+    getAttribute() { return ""; }
+  }), false);
+  assert.equal(newapi.isDestructiveControl({
+    textContent: "",
+    getAttribute(name) { return name === "aria-label" ? "Edit token" : ""; }
+  }), true);
+});
+
+test("recognizes NewAPI key page path variants and rejects near-misses", () => {
+  for (const path of [
+    "/keys",
+    "/keys/",
+    "/console/token",
+    "/console/token/",
+    "/token",
+    "/token/123",
+    "/app/console/token",
+    "/KEYS",
+    "/KEYS/"
+  ]) {
+    assert.equal(core.isNewApiKeysPath(path), true, path);
+  }
+  for (const path of [
+    "/",
+    "/console",
+    "/console/log",
+    "/console/tokens",
+    "/api/token",
+    "/api/token/",
+    "/keyboard",
+    "/my-keys-backup",
+    ""
+  ]) {
+    assert.equal(core.isNewApiKeysPath(path), false, path);
+  }
+});
+
+test("scales the collect budget with row count", () => {
+  assert.ok(newapi.defaultBudgetMs(1) >= 3500);
+  assert.ok(newapi.defaultBudgetMs(10) > newapi.defaultBudgetMs(1));
+  assert.equal(newapi.defaultBudgetMs(1000), 8000);
+});
+
+test("extracts rows when a real id column exists and marks source as id", () => {
+  const { JSDOM } = (() => { try { return require("jsdom"); } catch (_error) { return {}; } })();
+  if (!JSDOM) {
+    assert.equal(core.isNewApiKeyHeader("密钥"), true);
+    return;
+  }
+  const dom = new JSDOM(`<!doctype html><table><thead><tr>
+    <th>ID</th><th>名称</th><th>状态</th><th>密钥</th>
+  </tr></thead><tbody><tr>
+    <td>88</td><td>工作密钥</td><td>启用</td><td>sk-abcd**********efgh</td>
+  </tr></tbody></table>`);
+  const rows = core.extractNewApiRows(dom.window.document, "https://supercodes.vip/keys");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].tokenId, 88);
+  assert.equal(rows[0].tokenIdSource, "id");
+  assert.equal(rows[0].rawName, "工作密钥");
+  assert.equal(rows[0].apiKey, "");
+});
+
+test("detects English Open menu triggers as the menu adapter", () => {
+  const row = {
+    rowEl: {
+      querySelector(selector) {
+        return selectorHas(selector, 'aria-label="Open menu"') ? {} : null;
+      }
+    }
+  };
+  assert.equal(newapi.detectAdapter(emptyDoc(), [row]), "menu");
+});
+
+test("prefers React fiber token ids over untrusted numeric names", async () => {
+  const origin = "https://www.achai.cc";
+  const expectedKey = "sk-fiber_wins_1234567890ab";
+  const row = bareRow({
+    tokenId: 12,
+    tokenIdSource: "name",
+    rawName: "12",
+    endpoint: origin,
+    maskedKey: "fiber********key1",
+    rowEl: {
+      querySelector() { return null; },
+      __reactFiber$test: {
+        memoizedProps: { row: { original: { id: 9001 } } }
+      }
+    }
+  });
+  const fetchCalls = [];
+  await withExtractedRows([row], async () => {
+    const [result] = await newapi.collect({
+      document: emptyDoc(),
+      window: makeMessageWindow(),
+      location: { href: `${origin}/keys`, origin },
+      fetch: async url => {
+        fetchCalls.push(url);
+        assert.match(url, /\/api\/token\/9001\/key$/);
+        return {
+          ok: true,
+          async json() { return { success: true, data: { key: expectedKey } }; }
+        };
+      },
+      budgetMs: 1500
+    });
+    assert.equal(result.apiKey, expectedKey);
+    assert.equal(result.tokenId, 9001);
+    assert.equal(fetchCalls.some(url => url.includes("/api/token/?")), false);
+    assert.equal(fetchCalls.some(url => /\/api\/token\/12\/key$/.test(url)), false);
+  });
+});
+
+test("keeps name-derived ids that already exist in the token list", async () => {
+  const origin = "https://newapi.imagic.eu.org";
+  const row = bareRow({
+    tokenId: 23,
+    tokenIdSource: "name",
+    rawName: "23",
+    endpoint: origin,
+    maskedKey: "sk-0L6P**********Syd9"
+  });
+  await withExtractedRows([row], async () => {
+    const [result] = await newapi.collect({
+      document: emptyDoc(),
+      window: makeMessageWindow(),
+      location: { href: `${origin}/console/token`, origin },
+      fetch: async url => {
+        if (url.includes("/api/token/?")) {
+          return {
+            ok: true,
+            async json() {
+              return {
+                data: {
+                  items: [{ id: 23, name: "23", key: "sk-0L6P**********Syd9" }]
+                }
+              };
+            }
+          };
+        }
+        assert.match(url, /\/api\/token\/23\/key$/);
+        return {
+          ok: true,
+          async json() { return { data: { key: "kept_name_id_1234567890" } }; }
+        };
+      },
+      budgetMs: 1500
+    });
+    assert.equal(result.tokenId, 23);
+    assert.equal(result.apiKey, "sk-kept_name_id_1234567890");
+  });
+});
+
+test("matches token list rows by masked key when names differ", async () => {
+  const origin = "https://v-api.de5.net";
+  const row = bareRow({
+    rawName: "页面显示名",
+    endpoint: origin,
+    maskedKey: "maskAB********zz99"
+  });
+  await withExtractedRows([row], async () => {
+    const [result] = await newapi.collect({
+      document: emptyDoc(),
+      window: makeMessageWindow(),
+      location: { href: `${origin}/keys`, origin },
+      fetch: async url => {
+        if (url.includes("/api/token/?")) {
+          return {
+            ok: true,
+            async json() {
+              return {
+                data: {
+                  items: [
+                    { id: 11, name: "api-name-a", key: "other********0000" },
+                    { id: 22, name: "api-name-b", key: "maskAB********zz99" }
+                  ]
+                }
+              };
+            }
+          };
+        }
+        assert.match(url, /\/api\/token\/22\/key$/);
+        return {
+          ok: true,
+          async json() { return { data: { key: "mask_match_1234567890ab" } }; }
+        };
+      },
+      budgetMs: 1500
+    });
+    assert.equal(result.tokenId, 22);
+    assert.equal(result.apiKey, "sk-mask_match_1234567890ab");
+  });
+});
+
+test("uses 1:1 list order only when every remaining row is unresolved", async () => {
+  const origin = "https://supercodes.vip";
+  const rows = [
+    bareRow({
+      id: "a",
+      rawName: "alpha",
+      endpoint: origin,
+      maskedKey: "aaaa********1111"
+    }),
+    bareRow({
+      id: "b",
+      rawName: "beta",
+      endpoint: origin,
+      maskedKey: "bbbb********2222"
+    })
+  ];
+  await withExtractedRows(rows, async () => {
+    const results = await newapi.collect({
+      document: emptyDoc(),
+      window: makeMessageWindow(),
+      location: { href: `${origin}/keys`, origin },
+      fetch: async url => {
+        if (url.includes("/api/token/?")) {
+          return {
+            ok: true,
+            async json() {
+              // Names/masks intentionally do not match page rows.
+              return {
+                data: {
+                  items: [
+                    { id: 301, name: "x", key: "xxxx********9999" },
+                    { id: 302, name: "y", key: "yyyy********8888" }
+                  ]
+                }
+              };
+            }
+          };
+        }
+        const match = url.match(/\/api\/token\/(\d+)\/key$/);
+        assert.ok(match);
+        return {
+          ok: true,
+          async json() { return { data: { key: `order_${match[1]}_1234567890` } }; }
+        };
+      },
+      budgetMs: 2000
+    });
+    assert.equal(results[0].tokenId, 301);
+    assert.equal(results[1].tokenId, 302);
+    assert.equal(results[0].apiKey, "sk-order_301_1234567890");
+    assert.equal(results[1].apiKey, "sk-order_302_1234567890");
+  });
+});
+
+test("falls back to direct-copy clipboard when API key fetch fails", async () => {
+  const origin = "https://supercodes.vip";
+  const expectedKey = "sk-direct_fallback_1234567890";
+  const win = makeMessageWindow();
+  const clicks = { copy: 0 };
+  const direct = makeControl("", { title: "复制到剪贴板" }, () => {
+    clicks.copy += 1;
+    win.copy(expectedKey);
+  });
+  const row = bareRow({
+    tokenId: 55,
+    tokenIdSource: "id",
+    rawName: "55",
+    endpoint: origin,
+    maskedKey: "direct********key",
+    keyCell: {
+      querySelector(selector) {
+        return selectorHas(selector, '[title="复制到剪贴板"]') ? direct : null;
+      },
+      querySelectorAll() { return []; }
+    },
+    rowEl: {
+      querySelector(selector) {
+        return selectorHas(selector, '[title="复制到剪贴板"]') ? direct : null;
+      }
+    }
+  });
+  await withExtractedRows([row], async () => {
+    const [result] = await newapi.collect({
+      document: {
+        querySelector(selector) {
+          return selectorHas(selector, '[title="复制到剪贴板"]') ? direct : null;
+        },
+        querySelectorAll() { return []; }
+      },
+      window: win,
+      location: { href: `${origin}/keys`, origin },
+      fetch: async url => {
+        if (url.includes("/api/token/?")) {
+          return { ok: true, async json() { return { data: { items: [] } }; } };
+        }
+        return { ok: false, async json() { return {}; } };
+      },
+      budgetMs: 1500
+    });
+    assert.equal(result.apiKey, expectedKey);
+    assert.equal(result.adapter, "direct-copy");
+    assert.equal(clicks.copy, 1);
+    assert.equal(result.needsManualKey, false);
+  });
+});
+
+test("falls back to reveal copy menu when API and toggle both miss", async () => {
+  const origin = "https://newapi.imagic.eu.org";
+  const expectedKey = "sk-reveal_fallback_1234567890";
+  const win = makeMessageWindow();
+  const clicks = { toggle: 0, trigger: 0, item: 0 };
+  let menuOpen = false;
+  const toggle = makeControl("", { "aria-label": "toggle token visibility" }, () => {
+    clicks.toggle += 1;
+  });
+  const trigger = makeControl("", { "aria-label": "copy token key" }, () => {
+    clicks.trigger += 1;
+    menuOpen = true;
+  });
+  const item = makeControl("复制密钥", {}, () => {
+    clicks.item += 1;
+    win.copy(expectedKey);
+  });
+  const input = { value: "sk-xxx...xxxx" };
+  const row = bareRow({
+    tokenId: 23,
+    tokenIdSource: "id",
+    rawName: "23",
+    endpoint: origin,
+    maskedKey: "sk-xxx...xxxx",
+    keyCell: {
+      textContent: "sk-xxx...xxxx",
+      querySelector(selector) {
+        if (selectorHas(selector, '[aria-label="toggle token visibility"]')) return toggle;
+        if (selectorHas(selector, '[aria-label="copy token key"]')) return trigger;
+        return null;
+      },
+      querySelectorAll(selector) {
+        return selector === "input" ? [input] : [];
+      }
+    },
+    rowEl: {
+      querySelector(selector) {
+        if (selectorHas(selector, '[aria-label="toggle token visibility"]')) return toggle;
+        if (selectorHas(selector, '[aria-label="copy token key"]')) return trigger;
+        return null;
+      }
+    }
+  });
+  await withExtractedRows([row], async () => {
+    const [result] = await newapi.collect({
+      document: {
+        querySelector(selector) {
+          if (selectorHas(selector, '[aria-label="toggle token visibility"]')) return toggle;
+          return null;
+        },
+        querySelectorAll() {
+          return menuOpen ? [item] : [];
+        }
+      },
+      window: win,
+      location: { href: `${origin}/console/token`, origin },
+      fetch: async () => ({ ok: false, async json() { return {}; } }),
+      budgetMs: 1500
+    });
+    assert.equal(result.apiKey, expectedKey);
+    assert.equal(result.adapter, "reveal");
+    assert.equal(clicks.toggle, 1);
+    assert.equal(clicks.trigger, 1);
+    assert.equal(clicks.item, 1);
+  });
+});
+
+test("returns stable collect metadata and needsManualKey on total failure", async () => {
+  const origin = "https://www.achai.cc";
+  const row = bareRow({
+    tokenId: 0,
+    rawName: "ghost",
+    endpoint: origin,
+    maskedKey: "ghost********key"
+  });
+  await withExtractedRows([row], async () => {
+    const [result] = await newapi.collect({
+      document: emptyDoc({
+        querySelector(selector) {
+          return selectorHas(selector, 'aria-label="打开菜单"') ? {} : null;
+        }
+      }),
+      window: makeMessageWindow(),
+      location: { href: `${origin}/keys#ignored`, origin },
+      fetch: async () => {
+        throw new Error("network down");
+      },
+      budgetMs: 800
+    });
+    assert.equal(result.apiKey, "");
+    assert.equal(result.needsManualKey, true);
+    assert.equal(result.endpoint, origin);
+    assert.equal(result.name, `${origin}/keys`);
+    assert.equal(result.source, `${origin}/keys#ignored`);
+    assert.equal(result.adapter, "menu");
+    assert.equal(result.tokenId, 0);
+    assert.equal(result.model, "");
+  });
+});
+
+test("skips key fetch for invalid token ids and still exports the row", async () => {
+  const origin = "https://v-api.de5.net";
+  const fetchCalls = [];
+  const row = bareRow({
+    tokenId: 0,
+    rawName: "未匹配",
+    endpoint: origin,
+    maskedKey: "none********0000"
+  });
+  await withExtractedRows([row], async () => {
+    const results = await newapi.collect({
+      document: emptyDoc(),
+      window: makeMessageWindow(),
+      location: { href: `${origin}/keys`, origin },
+      fetch: async url => {
+        fetchCalls.push(url);
+        if (url.includes("/api/token/?")) {
+          return { ok: true, async json() { return { data: { items: [] } }; } };
+        }
+        throw new Error(`unexpected ${url}`);
+      },
+      budgetMs: 1000
+    });
+    assert.equal(results.length, 1);
+    assert.equal(results[0].apiKey, "");
+    assert.equal(results[0].needsManualKey, true);
+    assert.equal(fetchCalls.some(url => /\/api\/token\/\d+\/key$/.test(url)), false);
+  });
+});
+
+test("sends cookie credentials and New-Api-User on token API calls", async () => {
+  const originalStorage = global.localStorage;
+  global.localStorage = {
+    uid: "99",
+    getItem(key) { return this[key] ?? null; }
+  };
+  try {
+    let seen = null;
+    await core.fetchNewApiTokenKey("https://www.achai.cc", 7, async (url, options) => {
+      seen = { url, options };
+      return {
+        ok: true,
+        async json() { return { data: { key: "auth_header_1234567890ab" } }; }
+      };
+    });
+    assert.equal(seen.url, "https://www.achai.cc/api/token/7/key");
+    assert.equal(seen.options.method, "POST");
+    assert.equal(seen.options.credentials, "include");
+    assert.equal(seen.options.headers["New-Api-User"], "99");
+    assert.equal(seen.options.headers["Content-Type"], "application/json");
+    assert.equal(seen.options.headers.Authorization, undefined);
+  } finally {
+    if (originalStorage === undefined) delete global.localStorage;
+    else global.localStorage = originalStorage;
+  }
+});
+
+test("attaches bearer only from known auth objects with token fields", () => {
+  const originalStorage = global.localStorage;
+  global.localStorage = {
+    session: JSON.stringify({ user: { id: 5, token: "session-token-abc" } }),
+    getItem(key) { return this[key] ?? null; }
+  };
+  try {
+    assert.deepEqual(core.readNewApiAuthHeaders(), {
+      "Content-Type": "application/json",
+      "New-Api-User": "5",
+      Authorization: "Bearer session-token-abc"
+    });
+  } finally {
+    if (originalStorage === undefined) delete global.localStorage;
+    else global.localStorage = originalStorage;
+  }
+});
+
+test("does not click DOM copy controls when API already filled the key", async () => {
+  const origin = "https://supercodes.vip";
+  const win = makeMessageWindow();
+  const clicks = { copy: 0 };
+  const direct = makeControl("", { title: "复制到剪贴板" }, () => {
+    clicks.copy += 1;
+    win.copy("sk-should_not_use_1234567890");
+  });
+  const row = bareRow({
+    tokenId: 44,
+    tokenIdSource: "id",
+    rawName: "44",
+    endpoint: origin,
+    keyCell: {
+      querySelector(selector) {
+        return selectorHas(selector, '[title="复制到剪贴板"]') ? direct : null;
+      },
+      querySelectorAll() { return []; }
+    },
+    rowEl: {
+      querySelector(selector) {
+        return selectorHas(selector, '[title="复制到剪贴板"]') ? direct : null;
+      }
+    }
+  });
+  await withExtractedRows([row], async () => {
+    const [result] = await newapi.collect({
+      document: {
+        querySelector(selector) {
+          return selectorHas(selector, '[title="复制到剪贴板"]') ? direct : null;
+        },
+        querySelectorAll() { return []; }
+      },
+      window: win,
+      location: { href: `${origin}/keys`, origin },
+      fetch: async url => {
+        assert.match(url, /\/api\/token\/44\/key$/);
+        return {
+          ok: true,
+          async json() { return { data: { key: "api_already_ok_1234567890" } }; }
+        };
+      },
+      budgetMs: 1200
+    });
+    assert.equal(result.apiKey, "sk-api_already_ok_1234567890");
+    assert.equal(clicks.copy, 0);
+  });
+});
+
+test("collect returns an empty list when the page has no token rows", async () => {
+  const results = await newapi.collect({
+    document: emptyDoc(),
+    window: makeMessageWindow(),
+    location: {
+      href: "https://www.achai.cc/keys",
+      origin: "https://www.achai.cc"
+    },
+    fetch: async () => {
+      throw new Error("should not fetch without rows");
+    },
+    budgetMs: 500
+  });
+  assert.deepEqual(results, []);
+});
+
+test("trusted id-column token ids are used without requiring list rebinding", async () => {
+  const origin = "https://supercodes.vip";
+  const row = bareRow({
+    tokenId: 777,
+    tokenIdSource: "id",
+    rawName: "生产",
+    endpoint: origin,
+    maskedKey: "prod********key"
+  });
+  const fetchCalls = [];
+  await withExtractedRows([row], async () => {
+    const [result] = await newapi.collect({
+      document: emptyDoc(),
+      window: makeMessageWindow(),
+      location: { href: `${origin}/keys`, origin },
+      fetch: async url => {
+        fetchCalls.push(url);
+        assert.match(url, /\/api\/token\/777\/key$/);
+        return {
+          ok: true,
+          async json() { return { data: { apiKey: "trusted_id_1234567890ab" } }; }
+        };
+      },
+      budgetMs: 1000
+    });
+    assert.equal(result.apiKey, "sk-trusted_id_1234567890ab");
+    assert.equal(result.tokenId, 777);
+    assert.equal(fetchCalls.some(url => url.includes("/api/token/?")), false);
+  });
 });
