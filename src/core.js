@@ -315,28 +315,92 @@
     const tryParse = raw => {
       try { return raw ? JSON.parse(raw) : null; } catch (_error) { return null; }
     };
-    const pickUserId = obj => obj?.user?.id ?? obj?.auth?.user?.id ?? obj?.id ?? null;
+    const pickUserId = obj => {
+      if (obj == null || typeof obj !== "object") return null;
+      return obj.user?.id
+        ?? obj.auth?.user?.id
+        ?? obj.data?.user?.id
+        ?? obj.data?.id
+        ?? obj.state?.user?.id
+        ?? obj.profile?.id
+        ?? (Number.isFinite(Number(obj.id)) || /^\d+$/.test(String(obj.id || "")) ? obj.id : null)
+        ?? null;
+    };
     const pickToken = obj => clean(
-      obj?.token || obj?.access_token || obj?.accessToken || obj?.user?.token || ""
+      obj?.token
+      || obj?.access_token
+      || obj?.accessToken
+      || obj?.user?.token
+      || obj?.user?.access_token
+      || obj?.data?.token
+      || ""
     );
 
-    const uid = clean(storage.getItem("uid") || "");
-    if (uid) {
-      headers["New-Api-User"] = uid;
+    const uidKeys = ["uid", "userId", "user_id", "New-Api-User", "new-api-user"];
+    for (const key of uidKeys) {
+      const uid = clean(storage.getItem(key) || "");
+      if (uid && !headers["New-Api-User"]) headers["New-Api-User"] = uid;
     }
 
-    for (const key of ["user", "session", "auth"]) {
+    for (const key of ["user", "session", "auth", "userInfo", "user-info", "profile"]) {
       const parsed = tryParse(storage.getItem(key));
       if (!parsed) continue;
-      const userId = pickUserId(parsed) ?? pickUserId(parsed.user || {}) ?? pickUserId(parsed.state || {});
+      const userId = pickUserId(parsed)
+        ?? pickUserId(parsed.user || {})
+        ?? pickUserId(parsed.state || {})
+        ?? pickUserId(parsed.data || {});
       if (userId != null && !headers["New-Api-User"]) {
         headers["New-Api-User"] = String(userId);
       }
       // Only attach Bearer when the known auth object actually has a token field.
-      const token = pickToken(parsed) || pickToken(parsed.user || {}) || pickToken(parsed.state || {});
+      const token = pickToken(parsed)
+        || pickToken(parsed.user || {})
+        || pickToken(parsed.state || {})
+        || pickToken(parsed.data || {});
       if (token && !headers.Authorization) headers.Authorization = `Bearer ${token}`;
     }
     return headers;
+  }
+
+  function extractNewApiKeyPayload(payload) {
+    if (payload == null) return "";
+    if (typeof payload === "string") return normalizeNewApiKey(payload);
+    if (typeof payload !== "object") return "";
+    const candidates = [
+      payload?.data?.key,
+      payload?.data?.token,
+      payload?.data?.api_key,
+      payload?.data?.apiKey,
+      typeof payload?.data === "string" ? payload.data : "",
+      payload?.key,
+      payload?.token,
+      payload?.api_key,
+      payload?.apiKey
+    ];
+    for (const candidate of candidates) {
+      const key = normalizeNewApiKey(candidate);
+      if (key) return key;
+    }
+    return "";
+  }
+
+  function extractNewApiTokenListPayload(payload) {
+    if (Array.isArray(payload)) return payload;
+    if (!payload || typeof payload !== "object") return [];
+    const candidates = [
+      payload?.data?.items,
+      payload?.data?.data,
+      payload?.data?.list,
+      payload?.data?.tokens,
+      payload?.data,
+      payload?.items,
+      payload?.list,
+      payload?.tokens
+    ];
+    for (const candidate of candidates) {
+      if (Array.isArray(candidate)) return candidate;
+    }
+    return [];
   }
 
   async function fetchNewApiTokenKey(origin, tokenId, fetchImpl, options = {}) {
@@ -353,7 +417,7 @@
       });
       if (!response.ok) return "";
       const payload = await response.json();
-      return normalizeNewApiKey(payload?.data?.key || payload?.data?.token || payload?.key || "");
+      return extractNewApiKeyPayload(payload);
     } catch (_error) {}
     return "";
   }
@@ -361,9 +425,10 @@
   async function fetchNewApiTokenList(origin, fetchImpl, options = {}) {
     if (!origin) return [];
     const fetchFn = fetchImpl || fetch;
+    const size = Math.min(200, Math.max(1, Number(options.size) || 100));
     const url = new URL("/api/token/", origin);
-    url.searchParams.set("p", "1");
-    url.searchParams.set("size", String(options.size || 100));
+    url.searchParams.set("p", String(options.page || 1));
+    url.searchParams.set("size", String(size));
     try {
       const response = await fetchFn(url.toString(), {
         method: "GET",
@@ -373,8 +438,7 @@
       });
       if (!response.ok) return [];
       const payload = await response.json();
-      const items = payload?.data?.items || payload?.data;
-      return Array.isArray(items) ? items : [];
+      return extractNewApiTokenListPayload(payload);
     } catch (_error) {}
     return [];
   }
@@ -397,6 +461,7 @@
         const keyCell = getRowCellByHeader(row, headers, /(?:api\s*)?(?:密钥|key)|令牌|token/i, 4);
         const modelCell = getRowCellByHeader(row, headers, /可用模型|模型|model/i, 5);
         const statusCell = getRowCellByHeader(row, headers, /状态|status/i, 1);
+        const hasIdHeader = headers.some(header => /^(?:id|#)$/i.test(header));
         const rawIdText = clean(idCell?.textContent);
         const nameText = clean(nameCell?.textContent);
         const attrId = clean(
@@ -407,11 +472,23 @@
           || row.dataset?.id
           || ""
         );
-        const tokenId = (
-          /^\d+$/.test(rawIdText) ? Number(rawIdText)
-          : (/^\d+$/.test(nameText) ? Number(nameText)
-          : (/^\d+$/.test(attrId) ? Number(attrId) : 0))
-        );
+        // Numeric "名称" is often only a label on modern NewAPI forks (achai).
+        // Prefer a real id column/attr; keep name-derived ids as untrusted candidates.
+        let tokenId = 0;
+        let tokenIdSource = "";
+        if (hasIdHeader && /^\d+$/.test(rawIdText)) {
+          tokenId = Number(rawIdText);
+          tokenIdSource = "id";
+        } else if (/^\d+$/.test(attrId)) {
+          tokenId = Number(attrId);
+          tokenIdSource = "attr";
+        } else if (/^\d+$/.test(nameText)) {
+          tokenId = Number(nameText);
+          tokenIdSource = "name";
+        } else if (/^\d+$/.test(rawIdText)) {
+          tokenId = Number(rawIdText);
+          tokenIdSource = "id";
+        }
         const keyText = clean(keyCell?.textContent);
         const apiKey = getElementCandidates(keyCell)[0] || "";
         if (!nameText && !keyText && !attrId) return;
@@ -424,6 +501,7 @@
         result.push({
           id: tokenId ? `token-${tokenId}` : `${index}-${name}`,
           tokenId,
+          tokenIdSource,
           rawName: nameText,
           name,
           endpoint: origin,
@@ -594,6 +672,8 @@
     readNewApiAuthHeaders,
     fetchNewApiTokenKey,
     fetchNewApiTokenList,
+    extractNewApiKeyPayload,
+    extractNewApiTokenListPayload,
     normalizeNewApiKey,
     getHeaderTexts,
     getRowCells,

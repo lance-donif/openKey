@@ -230,13 +230,17 @@
           widget.open("没有发现 API Key 列表", `<div class="warning">请确认当前页面是 NewAPI 的 API 密钥列表页，并等待列表加载完成。</div>`, [{ label: "关闭", onClick: () => widget.close(), primary: true }]);
           return;
         }
-        widget.open("选择要导入的配置", `<div class="notice">选中后会直接创建 Sub2API 账号，再清除所有模型、同步上游全量模型，最后加入“白嫖”分组。</div>${configs.map((config, index) => configItemHtml(config, index, { hideModel: true })).join("")}`, [
+        const recognized = configs.filter(config => config.apiKey).length;
+        const notice = recognized === configs.length
+          ? `<div class="notice">已自动识别 ${recognized}/${configs.length} 条 Key。选中后会直接创建 Sub2API 账号，再清除所有模型、同步上游全量模型，最后加入“白嫖”分组。</div>`
+          : `<div class="notice">已自动识别 ${recognized}/${configs.length} 条 Key；失败行请在下方粘贴补全。选中后会直接创建 Sub2API 账号，再清除所有模型、同步上游全量模型，最后加入“白嫖”分组。</div>`;
+        widget.open("选择要导入的配置", `${notice}${configs.map((config, index) => configItemHtml(config, index, { hideModel: true })).join("")}`, [
           { label: "取消", onClick: () => widget.close() },
           { label: "直接导入 Sub2API", primary: true, onClick: async button => {
             const selected = getSelectedConfigs(widget.shadow, configs);
             if (!selected.length) return;
             if (selected.some(config => !config.apiKey)) {
-              widget.body.insertAdjacentHTML("afterbegin", `<div class="warning">有配置没有识别到完整 Key，请补充后再继续。</div>`);
+              widget.body.insertAdjacentHTML("afterbegin", `<div class="warning">有配置没有识别到完整 Key，请在本面板补充后再继续。</div>`);
               return;
             }
             button.disabled = true;

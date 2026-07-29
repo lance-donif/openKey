@@ -6,10 +6,20 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function createOpenKeyNewApi(CORE) {
   "use strict";
 
-  const BUDGET_MS = 900;
+  const BUDGET_MS = 3500;
+  const CLIPBOARD_TIMEOUT_MS = 800;
   const CLIPBOARD_CHANNEL = "openkey-clipboard-v1";
   const DESTRUCTIVE = /删除|delete|移除|remove|禁用|disable|编辑|edit|聊天|chat/i;
-  const KEY_ITEM = /^(?:复制密钥|Copy Key)$/;
+  const KEY_ITEM = /^(?:复制密钥|Copy Key|复制连接信息|Copy Connection Info|复制链接信息)$/i;
+  const DIRECT_COPY = '[title="复制到剪贴板"], [aria-label="复制到剪贴板"], [title="Copy to clipboard"], [aria-label="Copy to clipboard"]';
+  const REVEAL_TOGGLE = '[aria-label="toggle token visibility"], [aria-label="Toggle token visibility"]';
+  const REVEAL_COPY = '[aria-label="copy token key"], [aria-label="Copy token key"]';
+  const MENU_TRIGGER = [
+    '[data-slot="dropdown-menu-trigger"][aria-label="打开菜单"]',
+    '[data-slot="dropdown-menu-trigger"][aria-label="Open menu"]',
+    'button[aria-label="打开菜单"]',
+    'button[aria-label="Open menu"]'
+  ].join(", ");
 
   function text(value) {
     return String(value || "").replace(/\s+/g, " ").trim();
@@ -32,14 +42,17 @@
   }
 
   function detectAdapter(doc, rows = []) {
-    if (rowHas(rows, '[aria-label="toggle token visibility"]')
-      || doc?.querySelector?.('[aria-label="toggle token visibility"]')) return "reveal";
-    if (rowHas(rows, '[title="复制到剪贴板"]')
-      || doc?.querySelector?.('[title="复制到剪贴板"]')) return "direct-copy";
-    if (rowHas(rows, '[data-slot="dropdown-menu-trigger"][aria-label="打开菜单"]')
-      || rowHas(rows, '[data-slot="dropdown-menu-trigger"][aria-label="Open menu"]')
-      || doc?.querySelector?.('[data-slot="dropdown-menu-trigger"][aria-label="打开菜单"]')) return "menu";
+    if (rowHas(rows, REVEAL_TOGGLE)
+      || doc?.querySelector?.(REVEAL_TOGGLE)) return "reveal";
+    if (rowHas(rows, DIRECT_COPY)
+      || doc?.querySelector?.(DIRECT_COPY)) return "direct-copy";
+    if (rowHas(rows, MENU_TRIGGER)
+      || doc?.querySelector?.(MENU_TRIGGER)) return "menu";
     return "";
+  }
+
+  function defaultBudgetMs(rowCount = 1) {
+    return Math.min(8000, Math.max(BUDGET_MS, 600 + Number(rowCount || 1) * 400));
   }
 
   async function captureClipboard(run, timeout, win = window) {
@@ -128,7 +141,7 @@
 
   async function collectMenuSelection(row, trigger, itemPattern, doc, win, sourceUrl, deadline) {
     if (!trigger || isDestructiveControl(trigger) || remaining(deadline) <= 0) return;
-    const timeout = Math.min(550, remaining(deadline));
+    const timeout = Math.min(CLIPBOARD_TIMEOUT_MS, remaining(deadline));
     const actionDeadline = Date.now() + timeout;
     const copied = await captureClipboard(async () => {
       trigger.click();
@@ -140,40 +153,65 @@
     applyCopied(row, copied, sourceUrl);
   }
 
-  async function collectDirectRow(row, win, sourceUrl, deadline, selector) {
-    const button = row.keyCell?.querySelector?.(selector);
+  async function collectDirectRow(row, win, sourceUrl, deadline, selector = DIRECT_COPY) {
+    const button = row.keyCell?.querySelector?.(selector) || row.rowEl?.querySelector?.(selector);
     if (!button || isDestructiveControl(button) || remaining(deadline) <= 0) return;
     const copied = await captureClipboard(() => {
       button.click();
       return true;
-    }, Math.min(550, remaining(deadline)), win);
+    }, Math.min(CLIPBOARD_TIMEOUT_MS, remaining(deadline)), win);
     applyCopied(row, copied, sourceUrl);
   }
 
   async function collectRevealRow(row, doc, win, sourceUrl, deadline) {
     row.apiKey = readKey(row);
     if (row.apiKey) return;
-    const toggle = row.keyCell?.querySelector?.('[aria-label="toggle token visibility"]');
+    const toggle = row.keyCell?.querySelector?.(REVEAL_TOGGLE) || row.rowEl?.querySelector?.(REVEAL_TOGGLE);
     if (toggle && !isDestructiveControl(toggle)) {
       toggle.click();
       row.apiKey = await waitFor(
         () => readKey(row),
-        Math.min(deadline, Date.now() + 160)
+        Math.min(deadline, Date.now() + 200)
       ) || "";
     }
     if (!row.apiKey) {
-      const trigger = row.keyCell?.querySelector?.('[aria-label="copy token key"]');
+      const trigger = row.keyCell?.querySelector?.(REVEAL_COPY) || row.rowEl?.querySelector?.(REVEAL_COPY);
       await collectMenuSelection(row, trigger, KEY_ITEM, doc, win, sourceUrl, deadline);
     }
+  }
+
+  async function collectMenuRow(row, doc, win, sourceUrl, deadline) {
+    if (row.apiKey || remaining(deadline) <= 0) return;
+    const trigger = row.rowEl?.querySelector?.(MENU_TRIGGER)
+      || row.keyCell?.querySelector?.(MENU_TRIGGER);
+    await collectMenuSelection(row, trigger, KEY_ITEM, doc, win, sourceUrl, deadline);
+  }
+
+  async function collectGenericCopyRow(row, doc, win, sourceUrl, deadline) {
+    if (row.apiKey || remaining(deadline) <= 0) return;
+    const nodes = [
+      ...(row.keyCell?.querySelectorAll?.("button, [role='button'], a") || []),
+      ...(row.rowEl?.querySelectorAll?.("button, [role='button'], a") || [])
+    ];
+    const button = nodes.find(node => {
+      if (!visible(node) || isDestructiveControl(node)) return false;
+      return /复制|copy|clipboard/i.test(nodeLabel(node));
+    });
+    if (!button) return;
+    const copied = await captureClipboard(() => {
+      button.click();
+      return true;
+    }, Math.min(CLIPBOARD_TIMEOUT_MS, remaining(deadline)), win);
+    applyCopied(row, copied, sourceUrl);
   }
 
   async function collectDomRows(rows, adapter, doc, win, sourceUrl, deadline) {
     for (const row of rows) {
       if (row.apiKey || remaining(deadline) <= 0) continue;
       if (adapter === "reveal") await collectRevealRow(row, doc, win, sourceUrl, deadline);
-      if (adapter === "direct-copy") {
-        await collectDirectRow(row, win, sourceUrl, deadline, '[title="复制到剪贴板"]');
-      }
+      else if (adapter === "direct-copy") await collectDirectRow(row, win, sourceUrl, deadline);
+      else if (adapter === "menu") await collectMenuRow(row, doc, win, sourceUrl, deadline);
+      else await collectGenericCopyRow(row, doc, win, sourceUrl, deadline);
     }
   }
 
@@ -193,57 +231,132 @@
       && leftParts.at(-1) === rightParts.at(-1);
   }
 
-  function findTokenItem(row, items) {
-    const rawName = text(row.rawName || (row.tokenId ? String(row.tokenId) : ""));
-    const byName = items.filter(item => rawName && text(item?.name) === rawName);
+  function findTokenItem(row, items, usedIds) {
+    const rawName = text(row.rawName || "");
+    const available = items.filter(item => {
+      const id = Number(item?.id);
+      return Number.isInteger(id) && id > 0 && !usedIds.has(id);
+    });
+    const byName = available.filter(item => rawName && text(item?.name) === rawName);
     if (byName.length === 1) return byName[0];
-    const byMask = items.filter(item => sameMaskedKey(row.maskedKey, item?.key));
-    return byMask.length === 1 ? byMask[0] : null;
+    const byMask = available.filter(item => sameMaskedKey(row.maskedKey, item?.key));
+    if (byMask.length === 1) return byMask[0];
+    // Classic NewAPI token pages put the real id in the name column.
+    if (rawName && /^\d+$/.test(rawName)) {
+      const byId = available.filter(item => Number(item?.id) === Number(rawName));
+      if (byId.length === 1) return byId[0];
+    }
+    return null;
+  }
+
+  function listHasTokenId(items, tokenId) {
+    const id = Number(tokenId);
+    return Number.isInteger(id)
+      && id > 0
+      && items.some(item => Number(item?.id) === id);
+  }
+
+  function assignTokenId(row, id, source) {
+    const tokenId = Number(id);
+    if (!Number.isInteger(tokenId) || tokenId <= 0) return false;
+    row.tokenId = tokenId;
+    row.tokenIdSource = source;
+    row.id = `token-${tokenId}`;
+    return true;
   }
 
   function readModernTokenId(rowElement) {
     const fiberKey = Object.keys(rowElement || {}).find(key => key.startsWith("__reactFiber$"));
     let fiber = fiberKey ? rowElement[fiberKey] : null;
-    for (let level = 0; fiber && level < 12; level += 1, fiber = fiber.return) {
-      const id = fiber.memoizedProps?.row?.original?.id
-        ?? fiber.pendingProps?.row?.original?.id;
-      if (Number.isInteger(id) && id > 0) return id;
+    for (let level = 0; fiber && level < 16; level += 1, fiber = fiber.return) {
+      const candidates = [
+        fiber.memoizedProps?.row?.original?.id,
+        fiber.pendingProps?.row?.original?.id,
+        fiber.memoizedProps?.row?.id,
+        fiber.pendingProps?.row?.id,
+        fiber.memoizedProps?.original?.id,
+        fiber.pendingProps?.original?.id,
+        fiber.memoizedProps?.item?.id,
+        fiber.pendingProps?.item?.id,
+        fiber.memoizedProps?.token?.id,
+        fiber.pendingProps?.token?.id,
+        fiber.memoizedProps?.data?.id,
+        fiber.pendingProps?.data?.id
+      ];
+      for (const id of candidates) {
+        if (Number.isInteger(id) && id > 0) return id;
+        const numeric = Number(id);
+        if (Number.isInteger(numeric) && numeric > 0 && String(id).trim() === String(numeric)) {
+          return numeric;
+        }
+      }
     }
     return 0;
   }
 
-  async function collectMappedApiRows(rows, origin, fetchImpl, deadline) {
-    if (remaining(deadline) <= 0) return;
-    const unresolved = [];
+  async function resolveTokenIds(rows, origin, fetchImpl, deadline) {
+    if (!rows.length || remaining(deadline) <= 0) return;
+
     for (const row of rows) {
-      const id = readModernTokenId(row.rowEl);
-      if (id) row.tokenId = id;
-      else unresolved.push(row);
+      const fiberId = readModernTokenId(row.rowEl);
+      if (fiberId) assignTokenId(row, fiberId, "fiber");
     }
-    if (unresolved.length) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), Math.min(450, remaining(deadline)));
-      let items = [];
-      try {
-        items = await CORE.fetchNewApiTokenList(origin, fetchImpl, {
-          signal: controller.signal,
-          size: Math.max(20, rows.length)
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-      for (const row of unresolved) {
-        const item = findTokenItem(row, items);
-        if (item?.id) row.tokenId = Number(item.id);
-      }
+
+    const needsList = rows.some(row => !row.tokenId || row.tokenIdSource === "name");
+    if (!needsList || remaining(deadline) <= 0) return;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.min(1200, remaining(deadline)));
+    let items = [];
+    try {
+      items = await CORE.fetchNewApiTokenList(origin, fetchImpl, {
+        signal: controller.signal,
+        size: Math.min(200, Math.max(20, rows.length * 2))
+      });
+    } finally {
+      clearTimeout(timer);
     }
-    await Promise.all(rows.map(row => collectApiRow(row, origin, fetchImpl, deadline)));
+    if (!items.length) return;
+
+    // Drop name-derived ids that are not real token ids on this site.
+    for (const row of rows) {
+      if (row.tokenIdSource !== "name" || !row.tokenId) continue;
+      if (listHasTokenId(items, row.tokenId)) {
+        row.tokenIdSource = "list-id";
+        continue;
+      }
+      row.tokenId = 0;
+      row.tokenIdSource = "";
+    }
+
+    const usedIds = new Set(
+      rows.map(row => Number(row.tokenId)).filter(id => Number.isInteger(id) && id > 0)
+    );
+    const stillOpen = [];
+    for (const row of rows) {
+      if (row.tokenId) continue;
+      const item = findTokenItem(row, items, usedIds);
+      if (item?.id && assignTokenId(row, item.id, "list")) usedIds.add(row.tokenId);
+      else stillOpen.push(row);
+    }
+
+    // Positional mapping only when remaining rows and remaining list items are 1:1.
+    const available = items.filter(item => {
+      const id = Number(item?.id);
+      return Number.isInteger(id) && id > 0 && !usedIds.has(id);
+    });
+    if (stillOpen.length && stillOpen.length === available.length) {
+      stillOpen.forEach((row, index) => {
+        const item = available[index];
+        if (item?.id && assignTokenId(row, item.id, "list-order")) usedIds.add(row.tokenId);
+      });
+    }
   }
 
   async function collectApiRow(row, origin, fetchImpl, deadline) {
     if (row.apiKey || !row.tokenId || remaining(deadline) <= 0) return;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.min(600, remaining(deadline)));
+    const timer = setTimeout(() => controller.abort(), Math.min(1000, remaining(deadline)));
     try {
       const key = await CORE.fetchNewApiTokenKey(
         origin,
@@ -255,6 +368,12 @@
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  async function collectMappedApiRows(rows, origin, fetchImpl, deadline) {
+    if (!rows.length || remaining(deadline) <= 0) return;
+    await resolveTokenIds(rows, origin, fetchImpl, deadline);
+    await Promise.all(rows.map(row => collectApiRow(row, origin, fetchImpl, deadline)));
   }
 
   function pageUrl(locationValue) {
@@ -274,14 +393,23 @@
     const sourceUrl = locationValue.href;
     const rows = CORE.extractNewApiRows(doc, sourceUrl);
     const adapter = detectAdapter(doc, rows);
-    const deadline = Date.now() + (options.budgetMs || BUDGET_MS);
-    const apiWork = adapter === "menu"
-      ? collectMappedApiRows(rows, locationValue.origin, options.fetch, deadline)
-      : Promise.all(rows.map(row => collectApiRow(row, locationValue.origin, options.fetch, deadline)));
-    await Promise.all([
-      collectDomRows(rows, adapter, doc, win, sourceUrl, deadline),
-      apiWork
-    ]);
+    const apiFirst = options.apiFirst !== false;
+    const budgetMs = options.budgetMs || defaultBudgetMs(rows.length);
+    const deadline = Date.now() + budgetMs;
+
+    if (apiFirst) {
+      await collectMappedApiRows(rows, locationValue.origin, options.fetch, deadline);
+      const unresolved = rows.filter(row => !CORE.normalizeNewApiKey(row.apiKey));
+      if (unresolved.length && remaining(deadline) > 0) {
+        await collectDomRows(unresolved, adapter, doc, win, sourceUrl, deadline);
+      }
+    } else {
+      await Promise.all([
+        collectDomRows(rows, adapter, doc, win, sourceUrl, deadline),
+        collectMappedApiRows(rows, locationValue.origin, options.fetch, deadline)
+      ]);
+    }
+
     const name = pageUrl(locationValue);
     return rows.map(row => ({
       id: row.id,
@@ -290,6 +418,8 @@
       apiKey: CORE.normalizeNewApiKey(row.apiKey),
       model: "",
       source: sourceUrl,
+      tokenId: row.tokenId || 0,
+      adapter,
       needsManualKey: !CORE.normalizeNewApiKey(row.apiKey)
     }));
   }
@@ -297,6 +427,7 @@
   return {
     captureClipboard,
     collect,
+    defaultBudgetMs,
     detectAdapter,
     isDestructiveControl
   };

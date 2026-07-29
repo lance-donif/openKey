@@ -256,6 +256,15 @@ test("fetchNewApiTokenKey normalizes API response keys", async () => {
   assert.equal(calls, 1);
 });
 
+test("fetchNewApiTokenKey accepts alternate payload shapes", async () => {
+  const key = await core.fetchNewApiTokenKey("https://v-api.de5.net", 9, async () => ({
+    ok: true,
+    async json() { return { success: true, data: "altpayload_1234567890ab" }; }
+  }));
+  assert.equal(key, "sk-altpayload_1234567890ab");
+  assert.equal(core.extractNewApiKeyPayload({ data: { apiKey: "nested_api_key_123456" } }), "sk-nested_api_key_123456");
+});
+
 test("fetchNewApiTokenList returns the stable item list", async () => {
   const fetchImpl = async (url, options) => {
     assert.equal(url, "https://www.achai.cc/api/token/?p=1&size=20");
@@ -272,6 +281,20 @@ test("fetchNewApiTokenList returns the stable item list", async () => {
   };
   const items = await core.fetchNewApiTokenList("https://www.achai.cc", fetchImpl, { size: 20 });
   assert.deepEqual(items.map(item => ({ id: item.id, name: item.name })), [{ id: 326, name: "12" }]);
+});
+
+test("fetchNewApiTokenList accepts nested list payload shapes", async () => {
+  const items = await core.fetchNewApiTokenList("https://v-api.de5.net", async () => ({
+    ok: true,
+    async json() {
+      return { data: { list: [{ id: 7, name: "默认令牌" }] } };
+    }
+  }), { size: 50 });
+  assert.deepEqual(items.map(item => item.id), [7]);
+  assert.deepEqual(
+    core.extractNewApiTokenListPayload({ items: [{ id: 1 }] }).map(item => item.id),
+    [1]
+  );
 });
 
 test("parses NewAPI 复制链接信息 clipboard payloads", () => {
@@ -359,6 +382,25 @@ test("readNewApiAuthHeaders prefers uid cookie user and avoids fake bearer", () 
   }
 });
 
+test("readNewApiAuthHeaders accepts userInfo id without inventing bearer from junk", () => {
+  const originalStorage = global.localStorage;
+  const storage = {
+    userInfo: JSON.stringify({ id: 88, name: "demo" }),
+    junk: JSON.stringify({ token: "should-not-use" }),
+    getItem(key) { return this[key] ?? null; }
+  };
+  try {
+    global.localStorage = storage;
+    assert.deepEqual(core.readNewApiAuthHeaders(), {
+      "Content-Type": "application/json",
+      "New-Api-User": "88"
+    });
+  } finally {
+    if (originalStorage === undefined) delete global.localStorage;
+    else global.localStorage = originalStorage;
+  }
+});
+
 test("recognizes API 密钥 header used by achai-style keys pages", () => {
   assert.equal(core.isNewApiTokenHeaders(["名称", "状态", "API 密钥", "额度"]), true);
   assert.equal(core.isNewApiKeyHeader("API 密钥"), true);
@@ -393,32 +435,36 @@ test("extracts achai-style /keys rows with API 密钥 column", () => {
   const rows = core.extractNewApiRows(dom.window.document, "https://www.achai.cc/keys");
   assert.equal(rows.length, 1);
   assert.equal(rows[0].tokenId, 12);
+  assert.equal(rows[0].tokenIdSource, "name");
+  assert.equal(rows[0].rawName, "12");
   assert.equal(rows[0].apiKey, "");
   assert.match(String(rows[0].maskedKey || ""), /v0cs/i);
 });
 
 test("classifies the three supported NewAPI DOM structures", () => {
-  const fakeRow = selector => ({
+  const fakeRow = needle => ({
     rowEl: {
-      querySelector(value) { return value === selector ? {} : null; }
+      querySelector(value) {
+        return String(value || "").includes(needle) ? {} : null;
+      }
     }
   });
   const doc = { querySelector() { return null; } };
   assert.equal(
-    newapi.detectAdapter(doc, [fakeRow('[data-slot="dropdown-menu-trigger"][aria-label="打开菜单"]')]),
+    newapi.detectAdapter(doc, [fakeRow('aria-label="打开菜单"')]),
     "menu"
   );
   assert.equal(
-    newapi.detectAdapter(doc, [fakeRow('[aria-label="toggle token visibility"]')]),
+    newapi.detectAdapter(doc, [fakeRow('aria-label="toggle token visibility"')]),
     "reveal"
   );
   assert.equal(
-    newapi.detectAdapter(doc, [fakeRow('[title="复制到剪贴板"]')]),
+    newapi.detectAdapter(doc, [fakeRow('title="复制到剪贴板"')]),
     "direct-copy"
   );
 });
 
-test("uses the exact safe control flow for all three NewAPI adapters", async () => {
+test("uses API-first flow for all three NewAPI adapters without unsafe clicks", async () => {
   const originalExtractRows = core.extractNewApiRows;
   const makeWindow = () => {
     const listeners = new Set();
@@ -460,6 +506,10 @@ test("uses the exact safe control flow for all three NewAPI adapters", async () 
     getClientRects() { return [{}]; },
     click: onClick
   });
+  const matches = (selector, part) => String(selector || "")
+    .split(",")
+    .map(item => item.trim())
+    .some(item => item === part || item.includes(part));
   const run = async kind => {
     const win = makeWindow();
     const clicks = { toggle: 0, trigger: 0, item: 0, destructive: 0 };
@@ -517,9 +567,9 @@ test("uses the exact safe control flow for all three NewAPI adapters", async () 
       textContent: "sk-xxx...xxxx",
       getAttribute() { return null; },
       querySelector(selector) {
-        if (kind === "reveal" && selector === '[aria-label="toggle token visibility"]') return toggle;
-        if (kind === "reveal" && selector === '[aria-label="copy token key"]') return trigger;
-        if (kind === "direct-copy" && selector === '[title="复制到剪贴板"]') return direct;
+        if (kind === "reveal" && matches(selector, '[aria-label="toggle token visibility"]')) return toggle;
+        if (kind === "reveal" && matches(selector, '[aria-label="copy token key"]')) return trigger;
+        if (kind === "direct-copy" && matches(selector, '[title="复制到剪贴板"]')) return direct;
         return null;
       },
       querySelectorAll(selector) {
@@ -528,9 +578,9 @@ test("uses the exact safe control flow for all three NewAPI adapters", async () 
     };
     const rowEl = {
       querySelector(selector) {
-        if (kind === "menu" && selector.includes("dropdown-menu-trigger")) return trigger;
-        if (kind === "reveal" && selector === '[aria-label="toggle token visibility"]') return toggle;
-        if (kind === "direct-copy" && selector === '[title="复制到剪贴板"]') return direct;
+        if (kind === "menu" && matches(selector, "dropdown-menu-trigger")) return trigger;
+        if (kind === "reveal" && matches(selector, '[aria-label="toggle token visibility"]')) return toggle;
+        if (kind === "direct-copy" && matches(selector, '[title="复制到剪贴板"]')) return direct;
         return null;
       }
     };
@@ -564,7 +614,7 @@ test("uses the exact safe control flow for all three NewAPI adapters", async () 
         origin
       },
       fetch: fetchImpl,
-      budgetMs: 500
+      budgetMs: 1500
     });
     return { result, clicks, expectedKey, fetchCalls };
   };
@@ -574,19 +624,418 @@ test("uses the exact safe control flow for all three NewAPI adapters", async () 
       const { result, clicks, expectedKey, fetchCalls } = await run(kind);
       assert.equal(result.apiKey, expectedKey);
       assert.equal(clicks.destructive, 0);
+      assert.equal(clicks.trigger, 0);
+      assert.equal(clicks.item, 0);
+      assert.equal(clicks.toggle, 0);
+      assert.ok(fetchCalls.some(url => /\/api\/token\/326\/key$/.test(url)));
       if (kind === "menu") {
-        assert.equal(clicks.trigger, 0);
-        assert.equal(clicks.item, 0);
         assert.deepEqual(fetchCalls, [`${result.endpoint}/api/token/326/key`]);
       } else {
-        assert.equal(clicks.trigger, 1);
-        assert.equal(fetchCalls.length, 0);
-      }
-      if (kind === "reveal") {
-        assert.equal(clicks.toggle, 1);
-        assert.equal(clicks.item, 1);
+        assert.ok(fetchCalls.some(url => url.includes("/api/token/?")));
       }
     }
+  } finally {
+    core.extractNewApiRows = originalExtractRows;
+  }
+});
+
+test("falls back to menu clipboard copy when API key fetch fails", async () => {
+  const originalExtractRows = core.extractNewApiRows;
+  const listeners = new Set();
+  let token = "";
+  const dispatch = data => {
+    for (const listener of listeners) listener({ type: "message", data });
+  };
+  const win = {
+    addEventListener(type, listener) {
+      if (type === "message") listeners.add(listener);
+    },
+    removeEventListener(type, listener) {
+      if (type === "message") listeners.delete(listener);
+    },
+    postMessage(data) {
+      if (data.type === "arm") {
+        token = data.token;
+        queueMicrotask(() => dispatch({ ...data, type: "armed" }));
+      }
+      if (data.type === "disarm" && data.token === token) token = "";
+    }
+  };
+  const expectedKey = "sk-menu_fallback_1234567890";
+  const origin = "https://www.achai.cc";
+  let menuOpen = false;
+  const clicks = { trigger: 0, item: 0, destructive: 0 };
+  const control = (label, attributes, onClick) => ({
+    textContent: label,
+    hidden: false,
+    getAttribute(name) {
+      if (name === "aria-hidden") return null;
+      return attributes[name] || null;
+    },
+    getClientRects() { return [{}]; },
+    click: onClick
+  });
+  const trigger = control("", {
+    "aria-label": "打开菜单",
+    "data-slot": "dropdown-menu-trigger"
+  }, () => {
+    clicks.trigger += 1;
+    menuOpen = true;
+  });
+  const item = control("复制连接信息", {}, () => {
+    clicks.item += 1;
+    dispatch({
+      channel: "openkey-clipboard-v1",
+      type: "clipboard",
+      token,
+      text: `地址：${origin}\n密钥：${expectedKey}`
+    });
+  });
+  const destructive = control("删除", {}, () => { clicks.destructive += 1; });
+  const row = {
+    id: 1,
+    tokenId: 326,
+    rawName: "12",
+    endpoint: origin,
+    apiKey: "",
+    maskedKey: "menu********key",
+    keyCell: { querySelector() { return null; }, querySelectorAll() { return []; } },
+    rowEl: {
+      querySelector(selector) {
+        return String(selector || "").includes("dropdown-menu-trigger") ? trigger : null;
+      },
+      __reactFiber$test: {
+        memoizedProps: { row: { original: { id: 326 } } }
+      }
+    }
+  };
+  const doc = {
+    querySelector(selector) {
+      return String(selector || "").includes("dropdown-menu-trigger") ? trigger : null;
+    },
+    querySelectorAll() {
+      return menuOpen ? [destructive, item] : [];
+    }
+  };
+  const fetchImpl = async url => {
+    if (url.includes("/api/token/?")) {
+      return { ok: true, async json() { return { data: { items: [] } }; } };
+    }
+    return { ok: false, async json() { return {}; } };
+  };
+  core.extractNewApiRows = () => [row];
+  try {
+    const [result] = await newapi.collect({
+      document: doc,
+      window: win,
+      location: { href: `${origin}/keys`, origin },
+      fetch: fetchImpl,
+      budgetMs: 1500
+    });
+    assert.equal(result.apiKey, expectedKey);
+    assert.equal(clicks.trigger, 1);
+    assert.equal(clicks.item, 1);
+    assert.equal(clicks.destructive, 0);
+  } finally {
+    core.extractNewApiRows = originalExtractRows;
+  }
+});
+
+test("rebinds achai-style numeric name ids through the token list API", async () => {
+  const originalExtractRows = core.extractNewApiRows;
+  const origin = "https://www.achai.cc";
+  const expectedKey = "sk-achai_name_rebind_123456";
+  const fetchCalls = [];
+  const row = {
+    id: "token-12",
+    tokenId: 12,
+    tokenIdSource: "name",
+    rawName: "12",
+    endpoint: origin,
+    apiKey: "",
+    maskedKey: "sk-XU9e*********v0cs",
+    keyCell: { querySelector() { return null; }, querySelectorAll() { return []; } },
+    rowEl: { querySelector() { return null; } }
+  };
+  core.extractNewApiRows = () => [row];
+  try {
+    const [result] = await newapi.collect({
+      document: {
+        querySelector(selector) {
+          return String(selector || "").includes("dropdown-menu-trigger") ? {} : null;
+        },
+        querySelectorAll() { return []; }
+      },
+      window: {
+        addEventListener() {},
+        removeEventListener() {},
+        postMessage() {}
+      },
+      location: { href: `${origin}/keys`, origin },
+      fetch: async url => {
+        fetchCalls.push(url);
+        if (url.includes("/api/token/?")) {
+          return {
+            ok: true,
+            async json() {
+              return {
+                success: true,
+                data: {
+                  items: [{ id: 326, name: "12", key: "sk-XU9e*********v0cs" }]
+                }
+              };
+            }
+          };
+        }
+        assert.match(url, /\/api\/token\/326\/key$/);
+        assert.doesNotMatch(url, /\/api\/token\/12\/key$/);
+        return {
+          ok: true,
+          async json() { return { success: true, data: { key: expectedKey } }; }
+        };
+      },
+      budgetMs: 1500
+    });
+    assert.equal(result.apiKey, expectedKey);
+    assert.equal(result.tokenId, 326);
+    assert.ok(fetchCalls.some(url => url.includes("/api/token/?")));
+    assert.ok(fetchCalls.some(url => /\/api\/token\/326\/key$/.test(url)));
+    assert.equal(fetchCalls.some(url => /\/api\/token\/12\/key$/.test(url)), false);
+  } finally {
+    core.extractNewApiRows = originalExtractRows;
+  }
+});
+
+test("resolves mixed numeric and named rows without skipping the first key", async () => {
+  const originalExtractRows = core.extractNewApiRows;
+  const origin = "https://www.achai.cc";
+  const rows = [
+    {
+      id: "token-12",
+      tokenId: 12,
+      tokenIdSource: "name",
+      rawName: "12",
+      endpoint: origin,
+      apiKey: "",
+      maskedKey: "first********aaa1",
+      keyCell: { querySelector() { return null; }, querySelectorAll() { return []; } },
+      rowEl: { querySelector() { return null; } }
+    },
+    {
+      id: "named",
+      tokenId: 0,
+      tokenIdSource: "",
+      rawName: "备用令牌",
+      endpoint: origin,
+      apiKey: "",
+      maskedKey: "second********bbb2",
+      keyCell: { querySelector() { return null; }, querySelectorAll() { return []; } },
+      rowEl: { querySelector() { return null; } }
+    }
+  ];
+  core.extractNewApiRows = () => rows;
+  try {
+    const results = await newapi.collect({
+      document: {
+        querySelector(selector) {
+          return String(selector || "").includes("dropdown-menu-trigger") ? {} : null;
+        },
+        querySelectorAll() { return []; }
+      },
+      window: {
+        addEventListener() {},
+        removeEventListener() {},
+        postMessage() {}
+      },
+      location: { href: `${origin}/keys`, origin },
+      fetch: async url => {
+        if (url.includes("/api/token/?")) {
+          return {
+            ok: true,
+            async json() {
+              return {
+                success: true,
+                data: {
+                  items: [
+                    { id: 501, name: "12", key: "first********aaa1" },
+                    { id: 502, name: "备用令牌", key: "second********bbb2" }
+                  ]
+                }
+              };
+            }
+          };
+        }
+        const match = url.match(/\/api\/token\/(\d+)\/key$/);
+        assert.ok(match);
+        assert.notEqual(match[1], "12");
+        return {
+          ok: true,
+          async json() {
+            return {
+              success: true,
+              data: { key: `rowkey_${match[1]}_1234567890ab` }
+            };
+          }
+        };
+      },
+      budgetMs: 2000
+    });
+    assert.equal(results[0].apiKey, "sk-rowkey_501_1234567890ab");
+    assert.equal(results[0].tokenId, 501);
+    assert.equal(results[1].apiKey, "sk-rowkey_502_1234567890ab");
+    assert.equal(results[1].tokenId, 502);
+  } finally {
+    core.extractNewApiRows = originalExtractRows;
+  }
+});
+
+test("resolves non-numeric token names through the token list API", async () => {
+  const originalExtractRows = core.extractNewApiRows;
+  const origin = "https://v-api.de5.net";
+  const expectedKey = "sk-named_token_1234567890ab";
+  const fetchCalls = [];
+  const row = {
+    id: "named",
+    tokenId: 0,
+    rawName: "默认令牌",
+    endpoint: origin,
+    apiKey: "",
+    maskedKey: "named********7890",
+    keyCell: { querySelector() { return null; }, querySelectorAll() { return []; } },
+    rowEl: { querySelector() { return null; } }
+  };
+  core.extractNewApiRows = () => [row];
+  try {
+    const [result] = await newapi.collect({
+      document: { querySelector() { return null; }, querySelectorAll() { return []; } },
+      window: {
+        addEventListener() {},
+        removeEventListener() {},
+        postMessage() {}
+      },
+      location: { href: `${origin}/keys`, origin },
+      fetch: async url => {
+        fetchCalls.push(url);
+        if (url.includes("/api/token/?")) {
+          return {
+            ok: true,
+            async json() {
+              return {
+                success: true,
+                data: {
+                  items: [{ id: 77, name: "默认令牌", key: "named********7890" }]
+                }
+              };
+            }
+          };
+        }
+        assert.match(url, /\/api\/token\/77\/key$/);
+        return {
+          ok: true,
+          async json() { return { success: true, data: { key: expectedKey } }; }
+        };
+      },
+      budgetMs: 1500
+    });
+    assert.equal(result.apiKey, expectedKey);
+    assert.equal(result.tokenId, 77);
+    assert.ok(fetchCalls.some(url => url.includes("/api/token/?")));
+  } finally {
+    core.extractNewApiRows = originalExtractRows;
+  }
+});
+
+test("does not bind ambiguous duplicate token names from the list API", async () => {
+  const originalExtractRows = core.extractNewApiRows;
+  const origin = "https://www.achai.cc";
+  const row = {
+    id: "dup",
+    tokenId: 0,
+    rawName: "shared",
+    endpoint: origin,
+    apiKey: "",
+    maskedKey: "dup*********key",
+    keyCell: { querySelector() { return null; }, querySelectorAll() { return []; } },
+    rowEl: { querySelector() { return null; } }
+  };
+  core.extractNewApiRows = () => [row];
+  try {
+    const [result] = await newapi.collect({
+      document: { querySelector() { return null; }, querySelectorAll() { return []; } },
+      window: {
+        addEventListener() {},
+        removeEventListener() {},
+        postMessage() {}
+      },
+      location: { href: `${origin}/keys`, origin },
+      fetch: async url => {
+        if (url.includes("/api/token/?")) {
+          return {
+            ok: true,
+            async json() {
+              return {
+                data: {
+                  items: [
+                    { id: 1, name: "shared", key: "dup*********key" },
+                    { id: 2, name: "shared", key: "dup*********key" }
+                  ]
+                }
+              };
+            }
+          };
+        }
+        throw new Error(`unexpected key fetch ${url}`);
+      },
+      budgetMs: 1200
+    });
+    assert.equal(result.apiKey, "");
+    assert.equal(result.tokenId, 0);
+    assert.equal(result.needsManualKey, true);
+  } finally {
+    core.extractNewApiRows = originalExtractRows;
+  }
+});
+
+test("collects multiple rows through parallel API key fetches", async () => {
+  const originalExtractRows = core.extractNewApiRows;
+  const origin = "https://supercodes.vip";
+  const rows = [11, 12, 13].map(id => ({
+    id: `token-${id}`,
+    tokenId: id,
+    rawName: String(id),
+    endpoint: origin,
+    apiKey: "",
+    maskedKey: `row${id}********key`,
+    keyCell: { querySelector() { return null; }, querySelectorAll() { return []; } },
+    rowEl: { querySelector() { return null; } }
+  }));
+  core.extractNewApiRows = () => rows;
+  try {
+    const results = await newapi.collect({
+      document: { querySelector() { return null; }, querySelectorAll() { return []; } },
+      window: {
+        addEventListener() {},
+        removeEventListener() {},
+        postMessage() {}
+      },
+      location: { href: `${origin}/keys`, origin },
+      fetch: async url => {
+        const match = url.match(/\/api\/token\/(\d+)\/key$/);
+        assert.ok(match);
+        return {
+          ok: true,
+          async json() {
+            return { success: true, data: { key: `multirow_${match[1]}_1234567890` } };
+          }
+        };
+      },
+      budgetMs: 2000
+    });
+    assert.deepEqual(results.map(item => item.apiKey), [
+      "sk-multirow_11_1234567890",
+      "sk-multirow_12_1234567890",
+      "sk-multirow_13_1234567890"
+    ]);
   } finally {
     core.extractNewApiRows = originalExtractRows;
   }
