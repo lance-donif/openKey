@@ -217,7 +217,7 @@
     const toKey = candidate => {
       const textValue = trimPunctuation(candidate);
       if (!textValue || isMasked(textValue) || /^https?:\/\//i.test(textValue)) return "";
-      if (/^sk[-_]/i.test(textValue)) return isLikelyApiKey(textValue) ? textValue : "";
+      if (KEY_PREFIX_TEST_PATTERN.test(textValue)) return isLikelyApiKey(textValue) ? textValue : "";
       if (/^[A-Za-z0-9._-]{16,}$/.test(textValue)) return `sk-${textValue}`;
       return isLikelyApiKey(textValue) ? textValue : "";
     };
@@ -226,14 +226,25 @@
     let apiKey = "";
     let model = "";
 
-    const settingsMatch = value.match(/settings=(\{[\s\S]*?\})(?:$|[&\s"'`])/i)
-      || value.match(/(\{\s*"(?:key|url)"\s*:\s*"[^"]+"\s*,\s*"(?:key|url)"\s*:\s*"[^"]+"\s*\})/i);
-    if (settingsMatch) {
+    const settingsCandidates = [];
+    const settingsParameter = value.match(/(?:^|[?&#\s])settings=([^&\s]+)/i);
+    if (settingsParameter) {
+      const rawSettings = settingsParameter[1].replace(/[),.;]+$/g, "");
+      settingsCandidates.push(rawSettings);
       try {
-        const settings = JSON.parse(settingsMatch[1]);
+        settingsCandidates.push(decodeURIComponent(rawSettings.replace(/\+/g, " ")));
+      } catch (_error) {}
+    }
+    const inlineSettings = value.match(/(\{\s*"(?:key|url)"\s*:\s*"[^"]+"\s*,\s*"(?:key|url)"\s*:\s*"[^"]+"\s*\})/i);
+    if (inlineSettings) settingsCandidates.push(inlineSettings[1]);
+    for (const candidate of settingsCandidates) {
+      try {
+        const settings = JSON.parse(candidate);
+        if (!settings || typeof settings !== "object") continue;
         apiKey = toKey(settings.key || settings.apiKey || "");
         endpoint = normalizeEndpoint(settings.url || settings.baseURL || settings.baseUrl || "");
         model = clean(settings.model || "");
+        break;
       } catch (_error) {}
     }
 
@@ -337,8 +348,8 @@
   function normalizeNewApiKey(value) {
     const candidate = trimPunctuation(value);
     if (!candidate || isMasked(candidate) || /^https?:\/\//i.test(candidate)) return "";
-    if (/^sk[-_]/i.test(candidate)) return isLikelyApiKey(candidate) ? candidate : "";
-    // NewAPI stores the secret without the sk- prefix and only prefixes it when copying/using.
+    if (KEY_PREFIX_TEST_PATTERN.test(candidate)) return isLikelyApiKey(candidate) ? candidate : "";
+    // NewAPI stores bare secrets without a provider prefix and only prefixes those values when copying/using.
     if (/^[A-Za-z0-9._-]{16,}$/.test(candidate)) return `sk-${candidate}`;
     return isLikelyApiKey(candidate) ? candidate : "";
   }

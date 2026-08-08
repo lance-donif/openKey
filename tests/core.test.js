@@ -504,6 +504,31 @@ test("parses NewAPI 复制链接信息 clipboard payloads", () => {
   assert.equal(labeled.model, "gpt-4o");
 });
 
+test("parses URL-encoded NextChat settings", () => {
+  const encoded = encodeURIComponent(JSON.stringify({
+    key: "sk-encoded_link_1234567890",
+    url: "https://gateway.example.com/v1",
+    model: "gpt-4o"
+  }));
+  const result = core.parseNewApiConnectionInfo(
+    `https://app.nextchat.dev/#/?settings=${encoded}`,
+    "https://newapi.imagic.eu.org/console/token"
+  );
+  assert.equal(result.apiKey, "sk-encoded_link_1234567890");
+  assert.equal(result.endpoint, "https://gateway.example.com/v1");
+  assert.equal(result.model, "gpt-4o");
+});
+
+test("preserves recognized provider-specific API key prefixes", () => {
+  for (const key of [
+    "AIzaSyA12345678901234567890123456789",
+    "gsk_1234567890abcdef",
+    "xai-1234567890abcdef"
+  ]) {
+    assert.equal(core.normalizeNewApiKey(key), key, key);
+  }
+});
+
 test("does not treat API key bodies as models from connection info", () => {
   const key = "sk-0L6Po3pNAUzdPGmugh1OQxC60JJwOYuZbt3PFTaYSyd9";
   const merged = core.mergeNewApiCopiedInfo(
@@ -1585,7 +1610,7 @@ test("matches token list rows by masked key when names differ", async () => {
   });
 });
 
-test("uses 1:1 list order only when every remaining row is unresolved", async () => {
+test("does not map unresolved rows by API list position", async () => {
   const origin = "https://supercodes.vip";
   const rows = [
     bareRow({
@@ -1632,10 +1657,12 @@ test("uses 1:1 list order only when every remaining row is unresolved", async ()
       },
       budgetMs: 2000
     });
-    assert.equal(results[0].tokenId, 301);
-    assert.equal(results[1].tokenId, 302);
-    assert.equal(results[0].apiKey, "sk-order_301_1234567890");
-    assert.equal(results[1].apiKey, "sk-order_302_1234567890");
+    assert.equal(results[0].tokenId, 0);
+    assert.equal(results[1].tokenId, 0);
+    assert.equal(results[0].apiKey, "");
+    assert.equal(results[1].apiKey, "");
+    assert.equal(results[0].needsManualKey, true);
+    assert.equal(results[1].needsManualKey, true);
   });
 });
 

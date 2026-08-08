@@ -76,10 +76,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === "UPDATE_PENDING_IMPORT") {
     const configs = Array.isArray(message.configs) ? message.configs : [];
+    const createdAt = Date.now();
     const task = configs.length
-      ? getSessionStorage().set({ [SESSION_KEY]: { createdAt: Date.now(), configs } })
+      ? getSessionStorage().set({ [SESSION_KEY]: { createdAt, configs } })
       : getSessionStorage().remove(SESSION_KEY);
-    task.then(() => sendResponse({ ok: true }));
+    task.then(() => sendResponse({ ok: true, createdAt: configs.length ? createdAt : 0 }));
     return true;
   }
 

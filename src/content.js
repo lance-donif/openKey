@@ -302,6 +302,7 @@
   async function updatePendingConfigs(configs) {
     const result = await sendRuntimeMessage({ type: "UPDATE_PENDING_IMPORT", configs });
     if (!result?.ok) throw new Error(result?.error || "更新待导入配置失败");
+    return result;
   }
 
   function getNativeSub2ApiDialog(titlePattern = /^(?:添加账号|Add Account)$/) {
@@ -476,8 +477,7 @@
     createButton.click();
     const closed = await waitFor(() => !document.contains(dialog) || !visible(dialog), 10000);
     if (!closed) throw new Error("Sub2API 没有确认账号创建结果");
-
-    await finishSub2ApiAccountModelsAndGroup(plan);
+    return plan;
   }
 
   let handledDirectImportAt = 0;
@@ -497,16 +497,23 @@
         errors.push(`${config.name || "配置"}：缺少完整地址或 API Key`);
         continue;
       }
+      let plan = null;
       try {
-        await createSub2ApiAccountWithNativeUi(config);
+        plan = config.sub2ApiAccountCreated
+          ? CORE.buildSub2ApiUiImportPlan(config)
+          : await createSub2ApiAccountWithNativeUi(config);
+        await finishSub2ApiAccountModelsAndGroup(plan);
         imported += 1;
       } catch (error) {
-        remaining.push(config);
+        remaining.push(plan ? { ...config, sub2ApiAccountCreated: true } : config);
         errors.push(`${config.name || "配置"}：${error?.message || "导入失败"}`);
       }
     }
     try {
-      await updatePendingConfigs(remaining);
+      const updateResult = await updatePendingConfigs(remaining);
+      if (remaining.length && Number.isFinite(updateResult?.createdAt)) {
+        handledDirectImportAt = updateResult.createdAt;
+      }
       const failed = remaining.length
         ? `<div class="warning">${remaining.length} 条未完成（创建/清模型/同步上游/分组任一失败）。${errors.length ? `<br>${errors.map(item => escapeHtml(item)).join("<br>")}` : ""}</div>`
         : "";

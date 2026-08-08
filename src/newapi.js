@@ -332,24 +332,10 @@
     const usedIds = new Set(
       rows.map(row => Number(row.tokenId)).filter(id => Number.isInteger(id) && id > 0)
     );
-    const stillOpen = [];
     for (const row of rows) {
       if (row.tokenId) continue;
       const item = findTokenItem(row, items, usedIds);
       if (item?.id && assignTokenId(row, item.id, "list")) usedIds.add(row.tokenId);
-      else stillOpen.push(row);
-    }
-
-    // Positional mapping only when remaining rows and remaining list items are 1:1.
-    const available = items.filter(item => {
-      const id = Number(item?.id);
-      return Number.isInteger(id) && id > 0 && !usedIds.has(id);
-    });
-    if (stillOpen.length && stillOpen.length === available.length) {
-      stillOpen.forEach((row, index) => {
-        const item = available[index];
-        if (item?.id && assignTokenId(row, item.id, "list-order")) usedIds.add(row.tokenId);
-      });
     }
   }
 
