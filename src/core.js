@@ -247,17 +247,38 @@
       return "";
     }
 
-    function extractBase64Tokens(text) {
-      const tokens = [];
-      // Discourse wraps long base64 across lines (often leaving "= / A=" on the next line).
-      const value = String(text || "").replace(
-        /([A-Za-z0-9+/=_-])[ \t]*[\r\n]+[ \t]*(?=[A-Za-z0-9+/=_-])/g,
-        "$1"
-      );
+    function joinBase64Lines(text) {
+      const lines = String(text || "").split(/\r?\n/);
+      const output = [];
+      let base64Run = "";
+      const flush = () => {
+        if (base64Run) output.push(base64Run);
+        base64Run = "";
+      };
+      for (const line of lines) {
+        const segment = line.trim();
+        if (/^[A-Za-z0-9+/_-]+={0,2}$/.test(segment)) {
+          base64Run += segment;
+        } else {
+          flush();
+          output.push(line);
+        }
+      }
+      flush();
+      return output.join("\n");
+    }
+
+    function extractBase64Blobs(text) {
+      const value = joinBase64Lines(text);
       const tokenPattern =
         /(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{24,}={0,2})(?=$|[^A-Za-z0-9+/_-])/g;
-      for (const match of value.matchAll(tokenPattern)) {
-        const decoded = decodeBase64(match[1]);
+      return unique([...value.matchAll(tokenPattern)].map((match) => match[1]));
+    }
+
+    function extractBase64Tokens(text) {
+      const tokens = [];
+      for (const blob of extractBase64Blobs(text)) {
+        const decoded = decodeBase64(blob);
         if (
           decoded &&
           (/https?:\/\//i.test(decoded) || isLikelyApiKey(decoded))
@@ -997,14 +1018,7 @@
         rawParts.push(parseLooseConfigText(segment, sourceUrl));
         const wholeDecoded = decodeBase64(segment);
         if (wholeDecoded) pushDecoded(wholeDecoded, segment);
-        const joined = String(segment || "").replace(
-          /([A-Za-z0-9+/=_-])[ \t]*[\r\n]+[ \t]*(?=[A-Za-z0-9+/=_-])/g,
-          "$1"
-        );
-        for (const match of joined.matchAll(
-          /(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{24,}={0,2})(?=$|[^A-Za-z0-9+/_-])/g
-        )) {
-          const blob = match[1];
+        for (const blob of extractBase64Blobs(segment)) {
           const decoded = decodeBase64(blob);
           if (
             decoded &&

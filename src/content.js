@@ -85,7 +85,7 @@
     const modelLine = options.hideModel
       ? ""
       : `<br>模型：${escapeHtml(config.model || "未识别")}`;
-    return `<div class="item"><div class="item-top"><input type="checkbox" data-config-check="${index}" ${options.checked === false ? "" : "checked"}><div><div class="item-title">${escapeHtml(config.name || `配置 ${index + 1}`)}</div><div class="item-meta">地址：${escapeHtml(config.endpoint || "未识别")}<br>Key：${escapeHtml(CORE.maskSecret(config.apiKey))}${modelLine}</div></div></div>${manualKey}</div>`;
+    return `<div class="item"><div class="item-top"><input type="checkbox" data-config-check="${index}" ${options.checked === false ? "" : "checked"}><div><div class="item-title">${escapeHtml(config.name || `配置 ${index + 1}`)}</div><div class="item-meta">地址：${escapeHtml(config.endpoint || "未识别")}<br>Key：${escapeHtml(config.apiKey || "未识别")}${modelLine}</div></div></div>${manualKey}</div>`;
   }
 
   function plainKeyRowsHtml(configs) {
@@ -1014,19 +1014,22 @@
     const avatar =
       ownerArticle?.querySelector("img.avatar") ||
       ownerArticle?.querySelector("img");
+    const contentAnchor = ownerArticle?.querySelector(".cooked");
     const anchor =
+      contentAnchor ||
       avatar?.closest?.(".topic-avatar") ||
       avatar ||
       document.querySelector("main h1") ||
       findButton(document, (text) => text.includes("回复"));
+    const widgetPlacement = contentAnchor ? "inline-after" : "below-anchor";
 
     const widget = createWidget(
       "openkey-linuxdo-widget",
       "导入到 CC Switch",
       anchor,
-      { placement: "below-anchor" }
+      { placement: widgetPlacement }
     );
-    widget?.mount?.(anchor, { placement: "below-anchor" });
+    widget?.mount?.(anchor, { placement: widgetPlacement });
     if (widget && !widget.__initialized) {
       widget.__initialized = true;
       widget.onAction = async () => {
@@ -1071,9 +1074,9 @@
       "openkey-linuxdo-b64-widget",
       "Base64 解码",
       anchor,
-      { placement: "below-anchor" }
+      { placement: widgetPlacement }
     );
-    b64Widget?.mount?.(anchor, { placement: "below-anchor" });
+    b64Widget?.mount?.(anchor, { placement: widgetPlacement });
     if (!b64Widget || b64Widget.__initialized) return;
     b64Widget.__initialized = true;
     b64Widget.onAction = async () => {

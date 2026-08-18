@@ -244,6 +244,46 @@ test("single base64 payload yields one linux.do config without raw blob key", ()
   );
 });
 
+test("keeps a linux.do base64 key separate from a preceding endpoint label", () => {
+  const key = "sk-live_1234567890abcdef1234567890";
+  const encoded = Buffer.from(key, "utf8").toString("base64");
+  const ownerText = `会陆陆续续补号\nsub.ecvaixs.cn\n${encoded}`;
+  const endpointLink = {
+    matches(selector) {
+      return selector === "a[href]";
+    },
+    textContent: "sub.ecvaixs.cn",
+    getAttribute(name) {
+      return name === "href" ? "http://sub.ecvaixs.cn" : "";
+    },
+  };
+  const ownerArticle = {
+    innerText: ownerText,
+    textContent: ownerText,
+    querySelectorAll() {
+      return [endpointLink];
+    },
+  };
+  const doc = {
+    querySelector(selector) {
+      if (selector === "main article" || selector === "article")
+        return ownerArticle;
+      if (selector === "main h1" || selector === "h1")
+        return { textContent: "继续榨干额度" };
+      return null;
+    },
+  };
+
+  const configs = core.collectLinuxDoConfigs(
+    doc,
+    "https://linux.do/t/topic/2770914"
+  );
+
+  assert.equal(configs.length, 1);
+  assert.equal(configs[0].endpoint, "http://sub.ecvaixs.cn");
+  assert.equal(configs[0].apiKey, key);
+});
+
 test("collectLinuxDoConfigsFromBase64 builds importable configs", () => {
   const key = "sk-manual_b64_decode_1234567890ab";
   const encoded = Buffer.from(
