@@ -1,10 +1,10 @@
 <!doctype html>
 <html lang="zh-CN">
   <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>OpenKey</title>
-    <link rel="stylesheet" href="popup.css">
+    <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
     <main class="popup">
@@ -17,7 +17,11 @@
       </header>
       <section class="card">
         <label for="sub2api-url">Sub2API 账号页</label>
-        <input id="sub2api-url" type="url" placeholder="http://localhost:8080/admin/accounts">
+        <input
+          id="sub2api-url"
+          type="url"
+          placeholder="http://localhost:8080/admin/accounts"
+        />
         <p class="hint">A 网站导入时会打开这个地址。</p>
         <label for="cc-app">CC Switch 默认应用</label>
         <select id="cc-app">
@@ -30,8 +34,14 @@
       </section>
       <section class="help">
         <strong>使用方式</strong>
-        <p>在 NewAPI 的 API 密钥页点击“导出到 Sub2API”；在 Linux.do 话题页点击“导入到 CC Switch”。</p>
-        <p class="hint">Sub2API 会直接创建账号；CC Switch 导入仍需在 CC Switch 内确认；Key 只在当前流程和扩展会话中短暂保存。</p>
+        <p>
+          在 NewAPI 的 API 密钥页点击“导出到 Sub2API”；在 Linux.do
+          话题页点击“导入到 CC Switch”。
+        </p>
+        <p class="hint">
+          Sub2API 会直接创建账号；CC Switch 导入仍需在 CC Switch 内确认；Key
+          只在当前流程和扩展会话中短暂保存。
+        </p>
       </section>
     </main>
     <script src="popup.js"></script>

@@ -1,4 +1,6 @@
 /* UI is rendered in a ShadowRoot; this file only keeps the host from changing page layout. */
-#openkey-newapi-widget, #openkey-linuxdo-widget, #openkey-sub2api-widget {
+#openkey-newapi-widget,
+#openkey-linuxdo-widget,
+#openkey-sub2api-widget {
   contain: style;
 }
