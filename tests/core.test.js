@@ -434,6 +434,7 @@ test("normalizes Grok Build aliases for CC Switch provider links", () => {
 test("popup exposes the canonical Grok Build app value", () => {
   const html = fs.readFileSync(require.resolve("../src/popup.html"), "utf8");
   assert.match(html, /<option value="grokbuild">Grok Build<\/option>/);
+  assert.match(html, /<option value="pi">Pi<\/option>/);
   assert.doesNotMatch(html, /<option value="grok">/);
 });
 

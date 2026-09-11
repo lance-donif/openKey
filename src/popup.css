@@ -12,20 +12,20 @@ body {
 }
 .popup {
   width: 340px;
-  padding: 18px;
+  padding: var(--ok-space-lg);
 }
 header {
   display: flex;
-  gap: 10px;
+  gap: var(--ok-space-sm);
   align-items: center;
-  margin-bottom: 16px;
+  margin-bottom: var(--ok-space-lg);
 }
 .brand-mark {
   display: grid;
   place-items: center;
   width: 38px;
   height: 38px;
-  border-radius: 11px;
+  border-radius: var(--ok-radius-lg);
   color: #fff;
   background: linear-gradient(135deg, #2563eb, #7c3aed);
   font-size: 12px;
@@ -36,29 +36,29 @@ h1 {
   font-size: 18px;
 }
 header p {
-  margin: 3px 0 0;
+  margin: var(--ok-space-xs) 0 0;
   color: #64748b;
   font-size: 12px;
 }
 .card,
 .help {
   border: 1px solid #e2e8f0;
-  border-radius: 14px;
+  border-radius: var(--ok-radius-lg);
   background: #fff;
-  padding: 14px;
+  padding: var(--ok-space-md);
 }
 .help {
-  margin-top: 12px;
+  margin-top: var(--ok-space-md);
   color: #334155;
   font-size: 12px;
   line-height: 1.5;
 }
 .help p {
-  margin: 7px 0 0;
+  margin: var(--ok-space-sm) 0 0;
 }
 label {
   display: block;
-  margin-bottom: 6px;
+  margin-bottom: var(--ok-space-xs);
   color: #475569;
   font-size: 12px;
   font-weight: 600;
@@ -67,17 +67,17 @@ input,
 select {
   width: 100%;
   border: 1px solid #cbd5e1;
-  border-radius: 8px;
+  border-radius: var(--ok-radius-md);
   background: #fff;
   color: #0f172a;
-  padding: 9px 10px;
+  padding: var(--ok-space-sm) var(--ok-space-md);
   font-size: 13px;
 }
 select {
-  margin-bottom: 12px;
+  margin-bottom: var(--ok-space-md);
 }
 .hint {
-  margin: 5px 0 14px;
+  margin: var(--ok-space-xs) 0 var(--ok-space-md);
   color: #64748b;
   font-size: 11px;
   line-height: 1.4;
@@ -85,8 +85,8 @@ select {
 .primary {
   width: 100%;
   border: 0;
-  border-radius: 8px;
-  padding: 9px 12px;
+  border-radius: var(--ok-radius-md);
+  padding: var(--ok-space-sm) var(--ok-space-md);
   color: #fff;
   background: #2563eb;
   cursor: pointer;
@@ -94,7 +94,7 @@ select {
 }
 .status {
   min-height: 16px;
-  margin: 9px 0 0;
+  margin: var(--ok-space-sm) 0 0;
   font-size: 12px;
 }
 .success {

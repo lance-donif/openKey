@@ -23,7 +23,13 @@
     {
       "matches": ["http://*/*", "https://*/*"],
       "css": ["src/content.css"],
-      "js": ["src/core.js", "src/newapi.js", "src/widget.js", "src/content.js"],
+      "js": [
+        "src/tokens.js",
+        "src/core.js",
+        "src/newapi.js",
+        "src/widget.js",
+        "src/content.js"
+      ],
       "run_at": "document_idle"
     }
   ]

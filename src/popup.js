@@ -1,4 +1,11 @@
 (function initPopup() {
+  if (
+    typeof document !== "undefined" &&
+    typeof globalThis !== "undefined" &&
+    globalThis.OpenKeyTokens
+  ) {
+    globalThis.OpenKeyTokens.applyTo(document.documentElement);
+  }
   const DEFAULTS = {
     sub2apiUrl: "http://localhost:8080/admin/accounts",
     ccApp: "claude",

@@ -24,6 +24,7 @@ Security findings are intentionally excluded from the implementation scope for t
 ## Module Map (for future agents)
 
 - `src/core.js` — pure parsing/planning helpers (keys, models, endpoints, Base64, Sub2API plans, CC Switch links). No DOM or chrome APIs except optional globals guarded by `typeof`. Exported via `module.exports` and `globalThis.OpenKeyCore`.
+- `src/tokens.js` — single-source spacing/radius ladder (4px steps) as CSS variables (`--ok-*`) plus `px()`/`applyTo()` JS helpers. Loads first; enforced by `tests/tokens.test.js` (no hardcoded px radius/spacing elsewhere). Exported via `module.exports` and `globalThis.OpenKeyTokens`.
 - `src/newapi.js` — NewAPI token-table collection: row extraction, adapter detection, clipboard capture via the MAIN-world hook, API-first key fetch with bounded budget.
 - `src/page-hook.js` — MAIN-world clipboard hook (`window.__openKeyClipboardHookInstalled`); armed/disarmed by token over `postMessage` channel `openkey-clipboard-v1`.
 - `src/widget.js` — shadow-DOM widget factory (`OpenKeyWidget.create`); one widget per id per document.

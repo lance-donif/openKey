@@ -2,3 +2,7 @@ node_modules/
 
 .workbuddy
 .zcode
+
+# Windows 保留文件名 / 未展开环境变量的工具副产品，Chrome 打包会直接报错
+nul
+%TEMP%w.json

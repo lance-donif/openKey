@@ -147,6 +147,59 @@
     );
   }
 
+  function selectionToolbarHtml(total) {
+    return `<div class="select-bar" data-select-bar><span class="muted" data-select-count>已选 ${total}/${total}</span><span class="select-actions"><button type="button" class="link" data-select-all>全选</button><button type="button" class="link" data-select-none>全不选</button><button type="button" class="link" data-select-invert>反选</button></span></div>`;
+  }
+
+  function bindSelectionBar(root) {
+    const bar = root.querySelector("[data-select-bar]");
+    if (!bar) return;
+    const boxes = () => [...root.querySelectorAll("[data-config-check]")];
+    const count = bar.querySelector("[data-select-count]");
+    const update = () => {
+      const all = boxes();
+      const checked = all.filter((box) => box.checked).length;
+      if (count) count.textContent = `已选 ${checked}/${all.length}`;
+    };
+    const allBtn = bar.querySelector("[data-select-all]");
+    const noneBtn = bar.querySelector("[data-select-none]");
+    const invertBtn = bar.querySelector("[data-select-invert]");
+    if (allBtn)
+      allBtn.addEventListener("click", () => {
+        boxes().forEach((b) => {
+          b.checked = true;
+        });
+        update();
+      });
+    if (noneBtn)
+      noneBtn.addEventListener("click", () => {
+        boxes().forEach((b) => {
+          b.checked = false;
+        });
+        update();
+      });
+    if (invertBtn)
+      invertBtn.addEventListener("click", () => {
+        boxes().forEach((b) => {
+          b.checked = !b.checked;
+        });
+        update();
+      });
+    boxes().forEach((b) => b.addEventListener("change", update));
+    update();
+  }
+
+  function showInlineWarning(widget, html) {
+    widget.body
+      .querySelectorAll("[data-inline-warning]")
+      .forEach((n) => n.remove());
+    widget.body.insertAdjacentHTML(
+      "afterbegin",
+      '<div class="warning" data-inline-warning>' + html + "</div>"
+    );
+    widget.body.scrollTop = 0;
+  }
+
   function getSelectedConfigs(root, configs, options = {}) {
     return configs.flatMap((config, index) => {
       const checkbox = root.querySelector(`[data-config-check="${index}"]`);
@@ -212,7 +265,7 @@
             : `<div class="notice">已自动识别 ${recognized}/${configs.length} 条 Key；失败行请在下方粘贴补全。选中后会直接创建 Sub2API 账号，再清除所有模型、同步上游全量模型，最后加入“白嫖”分组。</div>`;
         widget.open(
           "选择要导入的配置",
-          `${notice}${configs.map((config, index) => configItemHtml(config, index, { hideModel: true })).join("")}`,
+          `${notice}${selectionToolbarHtml(configs.length)}${configs.map((config, index) => configItemHtml(config, index, { hideModel: true })).join("")}`,
           [
             { label: "取消", onClick: () => widget.close() },
             {
@@ -220,11 +273,14 @@
               primary: true,
               onClick: async (button) => {
                 const selected = getSelectedConfigs(widget.shadow, configs);
-                if (!selected.length) return;
+                if (!selected.length) {
+                  showInlineWarning(widget, "请至少选择一条配置。");
+                  return;
+                }
                 if (selected.some((config) => !config.apiKey)) {
-                  widget.body.insertAdjacentHTML(
-                    "afterbegin",
-                    `<div class="warning">有配置没有识别到完整 Key，请在本面板补充后再继续。</div>`
+                  showInlineWarning(
+                    widget,
+                    "有配置没有识别到完整 Key，请在本面板补充后再继续。"
                   );
                   return;
                 }
@@ -234,9 +290,9 @@
                   configs: selected,
                 });
                 if (!result?.ok) {
-                  widget.body.insertAdjacentHTML(
-                    "afterbegin",
-                    `<div class="warning">开始直接导入失败：${escapeHtml(result?.error || "未知错误")}</div>`
+                  showInlineWarning(
+                    widget,
+                    `开始直接导入失败：${escapeHtml(result?.error || "未知错误")}`
                   );
                   button.disabled = false;
                   return;
@@ -246,6 +302,7 @@
             },
           ]
         );
+        bindSelectionBar(widget.shadow);
       } catch (error) {
         widget.open(
           "导出失败",
@@ -911,9 +968,22 @@
       (config) => !config.apiKey || !config.endpoint
     );
     if (!selected.length || invalid.length) {
-      widget.body.insertAdjacentHTML(
-        "afterbegin",
-        `<div class="warning">${invalid.length ? `${invalid.length} 条配置缺少完整网址或 API Key。` : "请至少选择一条配置。"}</div>`
+      showInlineWarning(
+        widget,
+        invalid.length
+          ? `${invalid.length} 条配置缺少完整网址或 API Key。`
+          : "请至少选择一条配置。"
+      );
+      return;
+    }
+    // 上游 CC Switch 的 provider 深链接解析白名单暂无 "pi"
+    //（cc-switch src-tauri/src/deeplink/parser.rs parse_provider_deeplink，
+    // prompt 解析有 pi，唯独 provider 漏了），打开必报 Invalid provider app type。
+    // 先拦下并说明，上游补上后删掉这段即可。
+    if (app === "pi") {
+      showInlineWarning(
+        widget,
+        "当前 CC Switch 尚不支持通过深链接导入 pi（会报 Invalid provider app type），这是上游限制。请先选其他应用，或等 CC Switch 更新后再试。"
       );
       return;
     }
@@ -971,6 +1041,7 @@
       ["claude", "Claude Code"],
       ["codex", "Codex"],
       ["grokbuild", "Grok Build"],
+      ["pi", "Pi"],
     ]
       .map(
         ([value, label]) =>
@@ -1047,7 +1118,7 @@
           const settings = await chrome.storage.local.get({ ccApp: "claude" });
           widget.open(
             "选择 CC Switch 导入方式",
-            `<div class="notice">CC Switch 使用 ccswitch:// 深链接导入。链接包含 API Key，只会在你点击“导入”时交给本机 CC Switch。</div>${linuxDoAppSelectHtml(settings.ccApp)}${configs.map((config, index) => configItemHtml(config, index)).join("")}`,
+            `<div class="notice">CC Switch 使用 ccswitch:// 深链接导入。链接包含 API Key，只会在你点击“导入”时交给本机 CC Switch。</div>${linuxDoAppSelectHtml(settings.ccApp)}${selectionToolbarHtml(configs.length)}${configs.map((config, index) => configItemHtml(config, index)).join("")}`,
             [
               { label: "关闭", onClick: () => widget.close() },
               {
@@ -1058,6 +1129,7 @@
               },
             ]
           );
+          bindSelectionBar(widget.shadow);
         } catch (error) {
           widget.open(
             "识别失败",
